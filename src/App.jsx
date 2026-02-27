@@ -287,36 +287,497 @@ const inlineFormat = (text) => {
 };
 
 // ─── API ─────────────────────────────────────────────────────────────────────
-const callClaude = async (messages, apiKey) => {
-  const key = apiKey || (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ANTHROPIC_API_KEY) || '';
-  if (!key) throw new Error('No API key configured. Please enter your Anthropic API key in the settings panel (⚙ icon).');
+const TRANSCRIPTION_LANGUAGE_OPTIONS = [
+  { value: 'auto',  label: 'Auto-detect (browser locale)' },
+  { value: 'de-DE', label: 'German (de-DE)' },
+  { value: 'en-US', label: 'English (en-US)' },
+  { value: 'fr-FR', label: 'French (fr-FR)' },
+  { value: 'es-ES', label: 'Spanish (es-ES)' },
+  { value: 'it-IT', label: 'Italian (it-IT)' },
+  { value: 'nl-NL', label: 'Dutch (nl-NL)' },
+  { value: 'pt-PT', label: 'Portuguese (pt-PT)' },
+];
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
+const TRANSCRIPTION_ENGINE_OPTIONS = [
+  { value: 'auto', label: 'Auto (OpenAI then browser)' },
+  { value: 'openai', label: 'OpenAI Whisper' },
+  { value: 'browser', label: 'Browser speech recognition' },
+];
+
+const resolveAutoTranscriptionLanguage = () => {
+  if (typeof navigator === 'undefined') return 'en-US';
+  const preferred = [...(navigator.languages || []), navigator.language]
+    .filter(Boolean)
+    .map((l) => String(l).toLowerCase());
+
+  if (preferred.some((l) => l.startsWith('de'))) return 'de-DE';
+  if (preferred.some((l) => l.startsWith('en'))) return 'en-US';
+  if (preferred.some((l) => l.startsWith('fr'))) return 'fr-FR';
+  if (preferred.some((l) => l.startsWith('es'))) return 'es-ES';
+  if (preferred.some((l) => l.startsWith('it'))) return 'it-IT';
+  if (preferred.some((l) => l.startsWith('nl'))) return 'nl-NL';
+  if (preferred.some((l) => l.startsWith('pt'))) return 'pt-PT';
+  return 'en-US';
+};
+
+const getSpeechRecognitionErrorMessage = (code, language) => {
+  switch (code) {
+    case 'language-not-supported':
+      return `Speech recognition does not support ${language}. Choose another language in Settings.`;
+    case 'not-allowed':
+    case 'service-not-allowed':
+      return 'Microphone permission was denied. Allow microphone access and retry.';
+    case 'audio-capture':
+      return 'No audio input is available for speech recognition.';
+    case 'network':
+      return 'Speech recognition network error. Check connectivity and retry.';
+    default:
+      return `Speech recognition error: ${code}`;
+  }
+};
+
+const getVideoSourceErrorMessage = (video) => {
+  const code = video?.error?.code;
+  switch (code) {
+    case 1:
+      return 'Video loading was aborted before transcription started.';
+    case 2:
+      return 'A network error occurred while loading the video.';
+    case 3:
+      return 'The video could not be decoded by this browser.';
+    case 4:
+      return 'This video format/codec is not supported by your browser for transcription.';
+    default:
+      return 'The selected video source cannot be played in this browser.';
+  }
+};
+
+const waitForVideoReady = (video, timeoutMs = 15000) => new Promise((resolve, reject) => {
+  if (!video) {
+    reject(new Error('Video element not ready.'));
+    return;
+  }
+  if (video.error) {
+    reject(new Error(getVideoSourceErrorMessage(video)));
+    return;
+  }
+  if (video.readyState >= 2) {
+    resolve();
+    return;
+  }
+
+  let done = false;
+  const finish = (fn) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    video.removeEventListener('loadeddata', onReady);
+    video.removeEventListener('canplay', onReady);
+    video.removeEventListener('error', onError);
+    fn();
+  };
+  const onReady = () => finish(resolve);
+  const onError = () => finish(() => reject(new Error(getVideoSourceErrorMessage(video))));
+  const timer = setTimeout(() => finish(() => reject(new Error('Timed out while preparing video for transcription.'))), timeoutMs);
+
+  video.addEventListener('loadeddata', onReady);
+  video.addEventListener('canplay', onReady);
+  video.addEventListener('error', onError);
+});
+
+const DIRECT_ANTHROPIC_ENDPOINT = 'https://api.anthropic.com/v1/messages';
+const DIRECT_OPENAI_CHAT_ENDPOINT = 'https://api.openai.com/v1/chat/completions';
+const DIRECT_OPENAI_TRANSCRIPTION_ENDPOINT = 'https://api.openai.com/v1/audio/transcriptions';
+const OPENAI_TRANSCRIPTION_MAX_BYTES = 25 * 1024 * 1024;
+
+const getAnthropicEndpoints = () => {
+  const configured =
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ANTHROPIC_API_BASE_URL) || '';
+  if (configured.trim()) return [configured.trim()];
+
+  if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
+    return ['/api/anthropic/v1/messages', DIRECT_ANTHROPIC_ENDPOINT];
+  }
+  return [DIRECT_ANTHROPIC_ENDPOINT];
+};
+
+const getOpenAIChatEndpoints = () => {
+  const configured =
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_OPENAI_CHAT_API_BASE_URL) || '';
+  if (configured.trim()) return [configured.trim()];
+
+  if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
+    return ['/api/openai/v1/chat/completions', DIRECT_OPENAI_CHAT_ENDPOINT];
+  }
+  return [DIRECT_OPENAI_CHAT_ENDPOINT];
+};
+
+const getOpenAITranscriptionEndpoints = () => {
+  const configured =
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_OPENAI_TRANSCRIPTION_API_BASE_URL) || '';
+  if (configured.trim()) return [configured.trim()];
+
+  if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
+    return ['/api/openai/v1/audio/transcriptions', DIRECT_OPENAI_TRANSCRIPTION_ENDPOINT];
+  }
+  return [DIRECT_OPENAI_TRANSCRIPTION_ENDPOINT];
+};
+
+const getOpenAIKeyFromEnv = () =>
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_OPENAI_API_KEY) || '';
+
+const getOpenAIModel = () =>
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_OPENAI_MODEL) || 'gpt-4o-mini';
+
+const getOpenAITranscriptionModel = () =>
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_OPENAI_TRANSCRIPTION_MODEL) || 'whisper-1';
+
+const normalizeLanguageForOpenAI = (languageTag) => {
+  if (!languageTag || languageTag === 'auto') return '';
+  return String(languageTag).split('-')[0].toLowerCase();
+};
+
+const readApiErrorMessage = async (res) => {
+  const errText = await res.text().catch(() => '');
+  if (!errText) return `API error ${res.status}: ${res.statusText}`;
+  try {
+    const errData = JSON.parse(errText);
+    return errData.error?.message || errData.message || errText;
+  } catch {
+    return errText;
+  }
+};
+
+const extractOpenAIChatContent = (content) => {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part?.type === 'text') return part.text || '';
+        return part?.text || '';
+      })
+      .join('\n')
+      .trim();
+  }
+  return '';
+};
+
+const getSupportedAudioRecorderMimeType = () => {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const preferred = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+  ];
+  for (const type of preferred) {
+    try {
+      if (MediaRecorder.isTypeSupported(type)) return type;
+    } catch {}
+  }
+  return '';
+};
+
+const extractAudioTrackForWhisper = async (videoFile) => new Promise((resolve, reject) => {
+  if (typeof document === 'undefined') {
+    reject(new Error('Audio extraction is only available in browser runtime.'));
+    return;
+  }
+  const streamCapture = HTMLMediaElement.prototype.captureStream || HTMLMediaElement.prototype.mozCaptureStream;
+  if (!streamCapture) {
+    reject(new Error('This browser does not support media stream capture for large-file transcription.'));
+    return;
+  }
+
+  const objectUrl = URL.createObjectURL(videoFile);
+  const video = document.createElement('video');
+  video.src = objectUrl;
+  video.preload = 'auto';
+  video.muted = true;
+  video.playsInline = true;
+
+  let done = false;
+  let stream = null;
+  let recorder = null;
+  const chunks = [];
+  const timeout = setTimeout(() => {
+    finalize(new Error('Timed out while extracting audio for Whisper.'));
+  }, 120000);
+
+  const cleanup = () => {
+    clearTimeout(timeout);
+    URL.revokeObjectURL(objectUrl);
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+  };
+
+  const finalize = (err, file) => {
+    if (done) return;
+    done = true;
+    cleanup();
+    if (err) reject(err);
+    else resolve(file);
+  };
+
+  video.onerror = () => finalize(new Error('Failed to decode video while preparing audio for Whisper.'));
+
+  video.onloadedmetadata = async () => {
+    try {
+      stream = streamCapture.call(video);
+      const audioTracks = stream.getAudioTracks();
+      if (!audioTracks.length) {
+        finalize(new Error('No audio track found in video for Whisper transcription.'));
+        return;
+      }
+
+      const audioStream = new MediaStream(audioTracks);
+      const mimeType = getSupportedAudioRecorderMimeType();
+      const recOptions = mimeType
+        ? { mimeType, audioBitsPerSecond: 64000 }
+        : { audioBitsPerSecond: 64000 };
+
+      recorder = new MediaRecorder(audioStream, recOptions);
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+      recorder.onerror = () => finalize(new Error('MediaRecorder failed while extracting audio for Whisper.'));
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
+        if (!blob.size) {
+          finalize(new Error('Extracted audio blob is empty.'));
+          return;
+        }
+        const fileNameBase = (videoFile.name || 'audio').replace(/\.[^.]+$/, '');
+        const extension = blob.type.includes('mp4') ? 'm4a' : 'webm';
+        const audioFile = new File([blob], `${fileNameBase}.whisper.${extension}`, { type: blob.type || 'audio/webm' });
+        finalize(null, audioFile);
+      };
+
+      video.currentTime = 0;
+      recorder.start(1000);
+      await video.play();
+    } catch (err) {
+      finalize(new Error(`Could not prepare compact audio for Whisper: ${err?.message || err}`));
+      return;
+    }
+
+    video.onended = () => {
+      if (recorder && recorder.state === 'recording') recorder.stop();
+    };
+  };
+});
+
+const callOpenAIChat = async (messages, openAiApiKey = '') => {
+  const resolvedKey = openAiApiKey || getOpenAIKeyFromEnv();
+  const model = getOpenAIModel();
+  const endpoints = getOpenAIChatEndpoints();
+  let lastError;
+
+  for (let i = 0; i < endpoints.length; i++) {
+    const endpoint = endpoints[i];
+    const hasFallback = i < endpoints.length - 1;
+
+    if (!resolvedKey && !endpoint.startsWith('/api/openai')) {
+      lastError = new Error('No OpenAI API key available for direct OpenAI endpoint.');
+      continue;
+    }
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (resolvedKey) headers.Authorization = `Bearer ${resolvedKey}`;
+
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            ...messages.map((m) => ({ role: m.role, content: m.content })),
+          ],
+        }),
+      });
+    } catch (err) {
+      if (endpoint.startsWith('/api/openai') && hasFallback) {
+        lastError = new Error(`Local OpenAI proxy unavailable (${err?.message || 'Failed to fetch'}). Retrying direct OpenAI API...`);
+        continue;
+      }
+      throw new Error(`Unable to reach OpenAI API endpoint: ${err?.message || 'Failed to fetch'}`);
+    }
+
+    if (!res.ok) {
+      const message = await readApiErrorMessage(res);
+      if (endpoint.startsWith('/api/openai') && hasFallback && (res.status === 404 || res.status >= 500)) {
+        lastError = new Error(`Local OpenAI proxy error (${res.status}). Retrying direct OpenAI API...`);
+        continue;
+      }
+      throw new Error(message);
+    }
+
+    const data = await res.json();
+    const text = extractOpenAIChatContent(data?.choices?.[0]?.message?.content);
+    if (!text) throw new Error('OpenAI response did not include message text.');
+    return text;
+  }
+
+  throw lastError || new Error('Unable to reach OpenAI chat endpoint.');
+};
+
+const transcribeWithOpenAI = async (file, openAiApiKey = '', languageTag = 'auto') => {
+  if (!file) throw new Error('No video file provided for OpenAI transcription.');
+
+  const resolvedKey = openAiApiKey || getOpenAIKeyFromEnv();
+  const model = getOpenAITranscriptionModel();
+  const endpoints = getOpenAITranscriptionEndpoints();
+  const language = normalizeLanguageForOpenAI(languageTag);
+  let uploadFile = file;
+  if (file.size > OPENAI_TRANSCRIPTION_MAX_BYTES) {
+    uploadFile = await extractAudioTrackForWhisper(file);
+    if (uploadFile.size > OPENAI_TRANSCRIPTION_MAX_BYTES) {
+      throw new Error('OpenAI Whisper upload limit exceeded after audio extraction. Use browser transcription for this video.');
+    }
+  }
+  let lastError;
+
+  for (let i = 0; i < endpoints.length; i++) {
+    const endpoint = endpoints[i];
+    const hasFallback = i < endpoints.length - 1;
+
+    if (!resolvedKey && !endpoint.startsWith('/api/openai')) {
+      lastError = new Error('No OpenAI API key available for direct transcription endpoint.');
+      continue;
+    }
+
+    const form = new FormData();
+    form.append('file', uploadFile, uploadFile.name || 'audio.webm');
+    form.append('model', model);
+    form.append('response_format', 'verbose_json');
+    if (language) form.append('language', language);
+
+    const headers = {};
+    if (resolvedKey) headers.Authorization = `Bearer ${resolvedKey}`;
+
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: form,
+      });
+    } catch (err) {
+      if (endpoint.startsWith('/api/openai') && hasFallback) {
+        lastError = new Error(`Local OpenAI proxy unavailable (${err?.message || 'Failed to fetch'}). Retrying direct OpenAI API...`);
+        continue;
+      }
+      throw new Error(`Unable to reach OpenAI transcription endpoint: ${err?.message || 'Failed to fetch'}`);
+    }
+
+    if (!res.ok) {
+      const message = await readApiErrorMessage(res);
+      if (endpoint.startsWith('/api/openai') && hasFallback && (res.status === 404 || res.status >= 500)) {
+        lastError = new Error(`Local OpenAI proxy error (${res.status}). Retrying direct OpenAI API...`);
+        continue;
+      }
+      throw new Error(message);
+    }
+
+    const data = await res.json();
+    const segments = Array.isArray(data?.segments) && data.segments.length > 0
+      ? data.segments.map((s, idx) => ({
+          start: Number(s.start || 0),
+          end: Number(s.end || (Number(s.start || 0) + 5)),
+          text: String(s.text || '').trim(),
+          id: s.id ?? idx,
+        })).filter((s) => s.text)
+      : [{ start: 0, end: 10, text: String(data?.text || '').trim(), id: 0 }].filter((s) => s.text);
+
+    if (!segments.length) {
+      throw new Error('OpenAI transcription returned no usable text segments.');
+    }
+
+    return {
+      segments,
+      language: data?.language || (language || ''),
+      rawText: data?.text || segments.map((s) => s.text).join(' '),
+    };
+  }
+
+  throw lastError || new Error('Unable to reach OpenAI transcription endpoint.');
+};
+
+const callClaude = async (messages, apiKey, openAiApiKey = '') => {
+  const key = apiKey || (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ANTHROPIC_API_KEY) || '';
+  let anthropicError;
+
+  if (key) {
+    const headers = {
       'Content-Type': 'application/json',
       'x-api-key': key,
       'anthropic-version': '2023-06-01',
       'anthropic-dangerous-allow-browser': 'true',
-    },
-    body: JSON.stringify({
+    };
+    const body = JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       messages,
-    }),
-  });
+    });
+    const endpoints = getAnthropicEndpoints();
 
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData.error?.message || `API error ${res.status}: ${res.statusText}`);
+    for (let i = 0; i < endpoints.length; i++) {
+      const endpoint = endpoints[i];
+      const hasFallback = i < endpoints.length - 1;
+      let res;
+
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body,
+        });
+      } catch (err) {
+        if (endpoint.startsWith('/api/anthropic') && hasFallback) {
+          anthropicError = new Error(`Local Anthropic proxy unavailable (${err?.message || 'Failed to fetch'}). Retrying direct Anthropic API...`);
+          continue;
+        }
+        anthropicError = new Error(`${endpoint.startsWith('/api/anthropic') ? 'Cannot reach the local Anthropic proxy endpoint.' : 'Network/CORS error while contacting Anthropic API.'} ${err?.message || 'Failed to fetch'}`);
+        break;
+      }
+
+      if (!res.ok) {
+        const message = await readApiErrorMessage(res);
+        if (endpoint.startsWith('/api/anthropic') && hasFallback && (res.status === 404 || res.status >= 500)) {
+          anthropicError = new Error(`Local Anthropic proxy error (${res.status}). Retrying direct Anthropic API...`);
+          continue;
+        }
+        anthropicError = new Error(message);
+        break;
+      }
+
+      const data = await res.json();
+      const text = data?.content?.[0]?.text;
+      if (!text) {
+        anthropicError = new Error('Anthropic response did not include message text.');
+        break;
+      }
+      return text;
+    }
+  } else {
+    anthropicError = new Error('No Anthropic API key configured. Falling back to OpenAI.');
   }
 
-  const data = await res.json();
-  return data.content[0].text;
+  try {
+    return await callOpenAIChat(messages, openAiApiKey);
+  } catch (openErr) {
+    if (anthropicError) {
+      throw new Error(`${anthropicError.message} OpenAI fallback failed: ${openErr.message}`);
+    }
+    throw openErr;
+  }
 };
-
-// ─── FRAME EXTRACTION ────────────────────────────────────────────────────────
 const extractFrames = async (videoEl, startTime, endTime, fps = 1) => {
   const frames = [];
   const canvas = document.createElement('canvas');
@@ -470,7 +931,10 @@ export default function App() {
   const [videoThumbnail, setVideoThumbnail]           = useState('');
   const [transcript, setTranscript]                   = useState([]);
   const [transcriptionProgress, setTranscriptionProgress] = useState(0);
-  const [transcriptionMethod, setTranscriptionMethod] = useState('browser');
+  const [transcriptionMethod, setTranscriptionMethod] = useState('openai');
+  const [transcriptionEngine, setTranscriptionEngine] = useState('openai');
+  const [transcriptionLanguage, setTranscriptionLanguage] = useState('auto');
+  const [resolvedTranscriptionLanguage, setResolvedTranscriptionLanguage] = useState(resolveAutoTranscriptionLanguage);
   const [analysisResult, setAnalysisResult]           = useState(null);
   const [processingStep, setProcessingStep]           = useState(1);
   const [extractedFrames, setExtractedFrames]         = useState(new Map());
@@ -493,6 +957,8 @@ export default function App() {
   const [manualTranscript, setManualTranscript] = useState('');
   const [apiKey, setApiKey]               = useState('');
   const [showApiKey, setShowApiKey]       = useState(false);
+  const [openAiApiKey, setOpenAiApiKey]   = useState('');
+  const [showOpenAiApiKey, setShowOpenAiApiKey] = useState(false);
   const [showSettings, setShowSettings]   = useState(false);
   const [isSampleMode, setIsSampleMode]   = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
@@ -552,16 +1018,40 @@ export default function App() {
 
     const video = hiddenVideoRef.current;
     if (!video) throw new Error('Video element not ready.');
+    const activeLanguage = transcriptionLanguage === 'auto'
+      ? resolveAutoTranscriptionLanguage()
+      : transcriptionLanguage;
+    setResolvedTranscriptionLanguage(activeLanguage);
+    // Keep background transcription playback fully silent.
+    video.muted = true;
+    video.defaultMuted = true;
+    video.volume = 0;
+    video.preload = 'auto';
+    if (videoUrl && video.src !== videoUrl) video.src = videoUrl;
+    video.load();
+    await waitForVideoReady(video);
+    if (video.error) throw new Error(getVideoSourceErrorMessage(video));
 
     return new Promise((resolve, reject) => {
       const recognition = new SR();
       recognition.continuous      = true;
       recognition.interimResults  = true;
-      recognition.lang            = 'en-US';
+      recognition.lang            = activeLanguage;
       recognitionRef.current      = recognition;
+      let settled = false;
 
       const segments = [];
       let accumulated = '';
+      const safeResolve = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      const safeReject = (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
 
       recognition.onresult = (event) => {
         for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -581,7 +1071,7 @@ export default function App() {
 
       recognition.onerror = (e) => {
         if (e.error === 'no-speech' || e.error === 'aborted') return;
-        reject(new Error(`Speech recognition error: ${e.error}`));
+        safeReject(new Error(getSpeechRecognitionErrorMessage(e.error, activeLanguage)));
       };
 
       recognition.onend = () => {
@@ -589,21 +1079,53 @@ export default function App() {
         const result = segments.length > 0
           ? segments
           : [{ start: 0, end: video.duration || 10, text: accumulated || 'No speech detected.' }];
-        resolve(result);
+        safeResolve(result);
       };
 
       video.currentTime = 0;
       video.playbackRate = 1;
-      recognition.start();
-      video.play().catch(reject);
+      try {
+        recognition.start();
+      } catch (err) {
+        safeReject(new Error(`Unable to start speech recognition: ${err?.message || err}`));
+        return;
+      }
+      video.play().catch((err) => {
+        if (settled || cancelledRef.current) return;
+        if (video.error) {
+          safeReject(new Error(getVideoSourceErrorMessage(video)));
+          return;
+        }
+        const msg = String(err?.message || 'Playback failed');
+        // Ignore benign race where recognition ends quickly and pauses the video before play settles.
+        if (msg.toLowerCase().includes('interrupted')) return;
+        safeReject(new Error(`Unable to play video for transcription: ${msg}`));
+      });
 
-      video.onended  = () => recognition.stop();
+      video.onended  = () => { try { recognition.stop(); } catch {} };
       video.ontimeupdate = () => {
-        if (cancelledRef.current) { recognition.stop(); video.pause(); }
+        if (cancelledRef.current) {
+          try { recognition.stop(); } catch {}
+          video.pause();
+        }
         if (video.duration > 0) setTranscriptionProgress((video.currentTime / video.duration) * 100);
       };
     });
-  }, []);
+  }, [transcriptionLanguage, videoUrl]);
+  const startOpenAITranscription = useCallback(async () => {
+    if (!videoFile) throw new Error('No video file available for OpenAI transcription.');
+    setTranscriptionProgress(15);
+
+    const languageTag = transcriptionLanguage === 'auto' ? 'auto' : transcriptionLanguage;
+    const result = await transcribeWithOpenAI(videoFile, openAiApiKey, languageTag);
+
+    setResolvedTranscriptionLanguage(
+      result.language ? String(result.language) : (transcriptionLanguage === 'auto' ? 'auto' : transcriptionLanguage)
+    );
+    setLiveTranscript(result.rawText || result.segments.map((s) => s.text).join(' '));
+    setTranscriptionProgress(100);
+    return result.segments;
+  }, [videoFile, openAiApiKey, transcriptionLanguage]);
 
   // ─── PIPELINE: Parse manual/SRT/VTT transcript ────────────────────────────
   const parseManualTranscript = useCallback((text) => {
@@ -633,7 +1155,7 @@ export default function App() {
   const analyzeTranscript = useCallback(async (segs) => {
     const text = segs.map(s => `[${formatTime(s.start)}] ${s.text}`).join('\n');
     const msg  = `[TRANSCRIPT_ANALYSIS]\n\nVideo transcript for analysis:\n\n${text}`;
-    const raw  = await callClaude([{ role: 'user', content: msg }], apiKey);
+    const raw  = await callClaude([{ role: 'user', content: msg }], apiKey, openAiApiKey);
 
     let parsed;
     try {
@@ -642,13 +1164,13 @@ export default function App() {
       const m = raw.match(/\{[\s\S]*\}/);
       if (m) {
         try { parsed = JSON.parse(m[0]); }
-        catch { throw new Error('Unable to parse analysis response from Claude. Raw: ' + raw.slice(0, 400)); }
+        catch { throw new Error('Unable to parse analysis response from the model. Raw: ' + raw.slice(0, 400)); }
       } else {
         throw new Error('No JSON found in Claude response. Raw: ' + raw.slice(0, 400));
       }
     }
     return parsed;
-  }, [apiKey]);
+  }, [apiKey, openAiApiKey]);
 
   // ─── PIPELINE: Step 3 — Frame extraction ─────────────────────────────────
   const extractAllFrames = useCallback(async (flags) => {
@@ -665,8 +1187,10 @@ export default function App() {
     for (let i = 0; i < sorted.length; i++) {
       if (cancelledRef.current) break;
       const flag  = sorted[i];
-      const start = Math.max(0, parseTimestamp(flag.recommended_window_start));
-      const end   = parseTimestamp(flag.recommended_window_end);
+      const flaggedTime = parseTimestamp(flag.timestamp_start);
+      const start = Math.max(0, flaggedTime - 15);
+      const rawEnd = flaggedTime + 15;
+      const end = video.duration > 0 ? Math.min(rawEnd, video.duration) : rawEnd;
 
       try {
         const frames = await extractFrames(video, start, end, 1);
@@ -685,6 +1209,7 @@ export default function App() {
     cancelledRef.current = false;
     setMode('processing');
     setProcessingError('');
+    setTranscriptionMethod(method === 'manual' ? 'manual' : method === 'sample' ? 'sample' : (transcriptionEngine === 'browser' ? 'browser' : 'openai'));
     setProcessingStep(1);
     setTranscriptionProgress(0);
     setLiveTranscript('');
@@ -707,7 +1232,43 @@ export default function App() {
         await new Promise(r => setTimeout(r, 600));
       } else if (method === 'browser') {
         setIsSampleMode(false);
-        segs = await startBrowserTranscription();
+        if (transcriptionEngine === 'browser') {
+          setTranscriptionMethod('browser');
+          segs = await startBrowserTranscription();
+        } else if (transcriptionEngine === 'openai') {
+          setTranscriptionMethod('openai');
+          try {
+            segs = await startOpenAITranscription();
+          } catch (openErr) {
+            const openMsg = String(openErr?.message || '');
+            const likelySizeOrCodecIssue =
+              openMsg.includes('upload limit') ||
+              openMsg.includes('Maximum content size limit') ||
+              openMsg.includes('media stream capture') ||
+              openMsg.includes('decode video') ||
+              openMsg.includes('No audio track found');
+            if (!likelySizeOrCodecIssue) throw openErr;
+
+            try {
+              setTranscriptionMethod('browser');
+              segs = await startBrowserTranscription();
+            } catch (browserErr) {
+              throw new Error(`OpenAI transcription failed: ${openMsg}\nBrowser fallback failed: ${browserErr.message}`);
+            }
+          }
+        } else {
+          try {
+            setTranscriptionMethod('openai');
+            segs = await startOpenAITranscription();
+          } catch (openErr) {
+            try {
+              setTranscriptionMethod('browser');
+              segs = await startBrowserTranscription();
+            } catch (browserErr) {
+              throw new Error(`OpenAI transcription failed: ${openErr.message}\nBrowser fallback failed: ${browserErr.message}`);
+            }
+          }
+        }
       } else {
         setIsSampleMode(false);
         segs = parseManualTranscript(manualTranscript);
@@ -747,7 +1308,15 @@ export default function App() {
     } catch (e) {
       setProcessingError(e.message);
     }
-  }, [startBrowserTranscription, parseManualTranscript, analyzeTranscript, extractAllFrames, manualTranscript]);
+  }, [
+    transcriptionEngine,
+    startBrowserTranscription,
+    startOpenAITranscription,
+    parseManualTranscript,
+    analyzeTranscript,
+    extractAllFrames,
+    manualTranscript,
+  ]);
 
   // ─── VIDEO LOAD ───────────────────────────────────────────────────────────
   const handleVideoLoad = useCallback((file) => {
@@ -816,14 +1385,14 @@ export default function App() {
       }
 
       const msgs = [...history, ...chatMessages, userMsg];
-      const response = await callClaude(msgs, apiKey);
+      const response = await callClaude(msgs, apiKey, openAiApiKey);
       setChatMessages(prev => [...prev, { role: 'assistant', content: response }]);
     } catch (e) {
       setChatMessages(prev => [...prev, { role: 'assistant', content: `⚠ Error: ${e.message}` }]);
     } finally {
       setChatLoading(false);
     }
-  }, [chatLoading, chatMessages, analysisResult, videoFile, flagStatuses, apiKey]);
+  }, [chatLoading, chatMessages, analysisResult, videoFile, flagStatuses, apiKey, openAiApiKey]);
 
   const openChatWithFlag = useCallback((flag) => {
     const statusLabel = getStatusLabel(flagStatuses.get(flag.id));
@@ -852,6 +1421,9 @@ export default function App() {
         file_size: videoFile ? formatFileSize(videoFile.size) : 'N/A',
       },
       transcription_method: isSampleMode ? 'sample' : transcriptionMethod,
+      transcription_language: (transcriptionMethod === 'browser' || transcriptionMethod === 'openai')
+        ? (transcriptionLanguage === 'auto' ? `auto:${resolvedTranscriptionLanguage}` : transcriptionLanguage)
+        : null,
       analysis_summary: {
         overall_risk:       analysisResult.overall_risk,
         total_flags:        totalFlags,
@@ -884,7 +1456,17 @@ export default function App() {
     a.download  = `CredScan_Report_${fname}_${date}.json`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [analysisResult, videoFile, videoDuration, isSampleMode, transcriptionMethod, flagStatuses, flagNotes]);
+  }, [
+    analysisResult,
+    videoFile,
+    videoDuration,
+    isSampleMode,
+    transcriptionMethod,
+    transcriptionLanguage,
+    resolvedTranscriptionLanguage,
+    flagStatuses,
+    flagNotes,
+  ]);
 
   // ─── DERIVED STATE ────────────────────────────────────────────────────────
   const displayedFlags = analysisResult?.flags
@@ -900,6 +1482,9 @@ export default function App() {
 
   const selectedFlag   = analysisResult?.flags?.find(f => f.id === selectedFlagId);
   const selectedFrames = extractedFrames.get(selectedFlagId) || [];
+  const fullTranscriptText = transcript?.length
+    ? transcript.map((s) => `[${formatTime(s.start)}] ${s.text}`).join('\n')
+    : '';
 
   const statsConfirmed = [...flagStatuses.values()].filter(s => s === 'confirmed').length;
   const statsFP        = [...flagStatuses.values()].filter(s => s === 'false_positive').length;
@@ -919,10 +1504,11 @@ export default function App() {
         </button>
         {showSettings && (
           <div style={{ position: 'absolute', right: 0, top: 44, background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 16, width: 320, zIndex: 100 }} className="fadeIn">
-            <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight, marginBottom: 10 }}>Anthropic API Key</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight, marginBottom: 10 }}>API Settings</div>
             <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 8 }}>
-              Required for transcript analysis and chat. Obtained from{' '}
-              <span style={{ color: T.gold }}>console.anthropic.com</span>.
+              Configure Anthropic and/or OpenAI keys for analysis, chat, and transcription.
+              <span style={{ color: T.gold }}> console.anthropic.com </span>or
+              <span style={{ color: T.gold }}> platform.openai.com</span>.
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
               <input
@@ -936,6 +1522,76 @@ export default function App() {
                 style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.textMuted, cursor: 'pointer', fontSize: 11 }}>
                 {showApiKey ? 'Hide' : 'Show'}
               </button>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 11, color: T.textDim }}>
+              Anthropic key (analysis/chat primary)
+            </div>
+
+            <div style={{ marginTop: 12, display: 'flex', gap: 6 }}>
+              <input
+                type={showOpenAiApiKey ? 'text' : 'password'}
+                value={openAiApiKey}
+                onChange={e => setOpenAiApiKey(e.target.value)}
+                placeholder="OpenAI key (optional override)"
+                style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.text, fontSize: 12, fontFamily: T.mono, outline: 'none' }}
+              />
+              <button onClick={() => setShowOpenAiApiKey(s => !s)}
+                style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.textMuted, cursor: 'pointer', fontSize: 11 }}>
+                {showOpenAiApiKey ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <div style={{ marginTop: 6, fontSize: 11, color: T.textDim }}>
+              OpenAI key (transcription + Anthropic fallback). Large videos are auto-converted to compact audio for Whisper.
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Transcription engine</div>
+              <select
+                value={transcriptionEngine}
+                onChange={e => setTranscriptionEngine(e.target.value)}
+                style={{
+                  width: '100%',
+                  background: T.bgInput,
+                  border: `1px solid ${T.border}`,
+                  borderRadius: 6,
+                  padding: '7px 10px',
+                  color: T.text,
+                  fontSize: 12,
+                  fontFamily: T.serif,
+                  outline: 'none',
+                  cursor: 'pointer',
+                }}
+              >
+                {TRANSCRIPTION_ENGINE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Transcription language</div>
+              <select
+                value={transcriptionLanguage}
+                onChange={e => setTranscriptionLanguage(e.target.value)}
+                style={{
+                  width: '100%',
+                  background: T.bgInput,
+                  border: `1px solid ${T.border}`,
+                  borderRadius: 6,
+                  padding: '7px 10px',
+                  color: T.text,
+                  fontSize: 12,
+                  fontFamily: T.serif,
+                  outline: 'none',
+                  cursor: 'pointer',
+                }}
+              >
+                {TRANSCRIPTION_LANGUAGE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+              <div style={{ fontSize: 11, color: T.textDim, marginTop: 5 }}>
+                Auto mode uses OpenAI language detection (or browser locale when browser engine is active).
+              </div>
             </div>
             <div style={{ fontSize: 11, color: T.textDim, marginTop: 8 }}>
               Only the text transcript is sent to the API — no video data is transmitted.
@@ -1058,8 +1714,8 @@ export default function App() {
           <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }} className="fadeIn">
             {[
               { step: '1', icon: '🎥', title: 'Upload video', desc: 'Upload any corporate training or onboarding video. All processing is done locally in your browser.' },
-              { step: '2', icon: '🎙', title: 'Transcribe audio', desc: 'Browser speech recognition converts the audio to timestamped text. Or paste your own transcript.' },
-              { step: '3', icon: '🔍', title: 'AI analysis', desc: 'Claude analyzes the transcript for credential exposure risks and flags suspicious segments with detailed explanations.' },
+              { step: '2', icon: '🎙', title: 'Transcribe audio', desc: 'OpenAI Whisper (or browser speech recognition) converts audio to timestamped text. Or paste your own transcript.' },
+              { step: '3', icon: '🔍', title: 'AI analysis', desc: 'The configured AI model analyzes the transcript for credential exposure risks and flags suspicious segments with detailed explanations.' },
               { step: '4', icon: '🖼', title: 'Review & audit', desc: 'Review flagged segments, view extracted frames, mark findings, and export a complete audit report.' },
             ].map(item => (
               <div key={item.step} style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 16 }}>
@@ -1084,10 +1740,20 @@ export default function App() {
 
   // ─── RENDER: PROCESSING ──────────────────────────────────────────────────
   const renderProcessing = () => {
+    const browserLanguageLabel = transcriptionLanguage === 'auto'
+      ? `Auto (${resolvedTranscriptionLanguage})`
+      : resolvedTranscriptionLanguage;
+    const step1Sublabel = isSampleMode
+      ? 'Loading sample transcript'
+      : transcriptionMethod === 'manual'
+        ? 'Parsing manual transcript'
+        : transcriptionMethod === 'openai'
+          ? `Using OpenAI transcription (${browserLanguageLabel})`
+          : `Using browser speech recognition (${browserLanguageLabel})`;
     const steps = [
-      { num: 1, label: 'Transcribing audio', sublabel: isSampleMode ? 'Loading sample transcript' : transcriptionMethod === 'manual' ? 'Parsing manual transcript' : 'Using browser speech recognition' },
-      { num: 2, label: 'Analyzing transcript', sublabel: 'Scanning for credential exposure risks with Claude AI' },
-      { num: 3, label: 'Extracting frames', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `Processing ${analysisResult?.flags?.length || 0} flagged window${(analysisResult?.flags?.length || 0) !== 1 ? 's' : ''}` },
+      { num: 1, label: 'Transcribing audio', sublabel: step1Sublabel },
+      { num: 2, label: 'Analyzing transcript', sublabel: 'Scanning for credential exposure risks with configured AI model' },
+      { num: 3, label: 'Extracting frames', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `Processing ${analysisResult?.flags?.length || 0} flagged window${(analysisResult?.flags?.length || 0) !== 1 ? 's' : ''} (±15s around each flagged time)` },
       { num: 4, label: 'Compiling results', sublabel: 'Building audit workspace' },
     ];
 
@@ -1611,10 +2277,59 @@ export default function App() {
                 <Btn variant="outline" style={{ width: '100%', justifyContent: 'center' }} onClick={() => openChatWithFlag(selectedFlag)}>
                   <ChatIcon size={13} /> Ask AI about this finding
                 </Btn>
+
+                <div style={{ height: 1, background: T.border, margin: '16px 0' }} />
+
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                    Full Transcript
+                  </div>
+                  <textarea
+                    readOnly
+                    value={fullTranscriptText || 'No transcript available yet.'}
+                    style={{
+                      width: '100%',
+                      minHeight: 180,
+                      background: T.bgInput,
+                      border: `1px solid ${T.border}`,
+                      borderRadius: 6,
+                      padding: '8px 10px',
+                      color: T.text,
+                      fontSize: 11,
+                      fontFamily: T.mono,
+                      resize: 'vertical',
+                      outline: 'none',
+                      lineHeight: 1.6,
+                    }}
+                  />
+                </div>
               </div>
             ) : (
-              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: T.textDim, fontSize: 13, padding: 20, textAlign: 'center' }}>
-                Select a flagged segment to see details and AI assessment.
+              <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+                <div style={{ color: T.textDim, fontSize: 13, textAlign: 'center', marginBottom: 16 }}>
+                  Select a flagged segment to see details and AI assessment.
+                </div>
+                <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  Full Transcript
+                </div>
+                <textarea
+                  readOnly
+                  value={fullTranscriptText || 'No transcript available yet.'}
+                  style={{
+                    width: '100%',
+                    minHeight: 220,
+                    background: T.bgInput,
+                    border: `1px solid ${T.border}`,
+                    borderRadius: 6,
+                    padding: '8px 10px',
+                    color: T.text,
+                    fontSize: 11,
+                    fontFamily: T.mono,
+                    resize: 'vertical',
+                    outline: 'none',
+                    lineHeight: 1.6,
+                  }}
+                />
               </div>
             )}
           </div>
@@ -1651,7 +2366,7 @@ export default function App() {
         </div>
 
         {/* Hidden video for frame extraction re-runs */}
-        <video ref={hiddenVideoRef} src={videoUrl} style={{ display: 'none' }} crossOrigin="anonymous" />
+        <video ref={hiddenVideoRef} src={videoUrl} style={{ display: 'none' }} crossOrigin="anonymous" muted playsInline />
       </div>
     );
   };
@@ -1837,8 +2552,11 @@ export default function App() {
 
       {/* Hidden video element for processing pipeline */}
       {mode !== 'results' && (
-        <video ref={hiddenVideoRef} src={videoUrl} style={{ display: 'none' }} crossOrigin="anonymous" />
+        <video ref={hiddenVideoRef} src={videoUrl} style={{ display: 'none' }} crossOrigin="anonymous" muted playsInline />
       )}
     </div>
   );
 }
+
+
+
