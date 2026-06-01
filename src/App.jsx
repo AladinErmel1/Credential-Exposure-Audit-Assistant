@@ -2243,9 +2243,11 @@ export default function App() {
               /* Visual findings tab */
               <div style={{ flex: 1, overflowY: 'auto' }}>
                 {visualFindings.length === 0 ? (
-                  <div style={{ padding: 24, textAlign: 'center', color: T.textDim, fontSize: 13 }}>
+                  <div style={{ padding: 24, textAlign: 'center', color: T.textDim, fontSize: 13, lineHeight: 1.7 }}>
                     <div style={{ fontSize: 28, marginBottom: 8 }}>🖼</div>
-                    No visual credential findings detected.
+                    {isSampleMode
+                      ? 'Upload a real video to run the visual credential scan.'
+                      : '✓ No visible credentials detected\nacross sampled video frames.'}
                   </div>
                 ) : (
                   visualFindings.map((finding, idx) => {
@@ -2406,7 +2408,15 @@ export default function App() {
                     )}
                   </>
                 );
-              })() : selectedFlag ? (
+              })() : leftPanelTab === 'visual' ? (
+                <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: T.textDim, fontSize: 13 }}>
+                  {visualFindings.length > 0
+                    ? 'Select a visual detection to view the frame.'
+                    : isSampleMode
+                      ? '🖼 Upload a video to run the visual scan.'
+                      : '✓ No visible credentials detected across sampled video frames.'}
+                </div>
+              ) : selectedFlag ? (
                 <>
                   <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10 }}>
                     Extracted frames — Flag #{selectedFlag.id} · {selectedFlag.timestamp_start}–{selectedFlag.timestamp_end}
@@ -2465,7 +2475,21 @@ export default function App() {
             width: 280, flexShrink: 0, borderLeft: `1px solid ${T.border}`,
             background: T.bgCard, display: 'flex', flexDirection: 'column', overflow: 'hidden',
           }}>
-            {leftPanelTab === 'visual' && selectedVisualIdx !== null ? (() => {
+            {leftPanelTab === 'visual' && selectedVisualIdx === null ? (
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 20, gap: 10 }}>
+                <div style={{ fontSize: 28, opacity: 0.4 }}>🖼</div>
+                <div style={{ fontSize: 13, color: T.textDim, textAlign: 'center', lineHeight: 1.6 }}>
+                  {visualFindings.length > 0
+                    ? 'Select a visual detection from the left panel to see details.'
+                    : isSampleMode
+                      ? 'Visual scan requires a real video file.\n\nUpload a video on the welcome screen to enable full analysis.'
+                      : 'No visible credentials were detected across the sampled video frames.'}
+                </div>
+                {isSampleMode && (
+                  <Btn variant="outline" small onClick={() => setMode('welcome')}>Upload a video</Btn>
+                )}
+              </div>
+            ) : leftPanelTab === 'visual' && selectedVisualIdx !== null ? (() => {
               const vf = visualFindings[selectedVisualIdx];
               if (!vf) return null;
               return (
