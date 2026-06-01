@@ -967,6 +967,10 @@ export default function App() {
   const [showFrameIndex, setShowFrameIndex] = useState(0);
   const [visualAnalysis, setVisualAnalysis] = useState(new Map());
   const [visualAnalysisProgress, setVisualAnalysisProgress] = useState({ current: 0, total: 0 });
+  const [visualFindings, setVisualFindings]   = useState([]);
+  const [visualScanProgress, setVisualScanProgress] = useState({ current: 0, total: 0, phase: 'extracting' });
+  const [leftPanelTab, setLeftPanelTab]       = useState('audio');
+  const [selectedVisualIdx, setSelectedVisualIdx] = useState(null);
 
   // Refs
   const videoRef        = useRef(null);
@@ -1268,6 +1272,96 @@ export default function App() {
     }
   }, [apiKey, openAiApiKey]);
 
+  // ─── PIPELINE: Full-video visual credential scan ──────────────────────────
+  const scanVideoFramesVisually = useCallback(async () => {
+    const video = hiddenVideoRef.current;
+    if (!video || !videoUrl) return [];
+    const duration = video.duration;
+    if (!duration || duration <= 0 || !isFinite(duration)) return [];
+
+    // Adaptive sampling: max 40 frames, minimum 5s interval
+    const interval = Math.max(5, Math.ceil(duration / 40));
+    const times = [];
+    for (let t = 0; t <= duration; t += interval) times.push(Math.min(t, duration));
+
+    setVisualScanProgress({ current: 0, total: times.length, phase: 'extracting' });
+
+    // Extract sample frames
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 360;
+    const ctx = canvas.getContext('2d');
+    const frameData = [];
+
+    for (let i = 0; i < times.length; i++) {
+      if (cancelledRef.current) break;
+      try {
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('seek timeout')), 5000);
+          video.onseeked = () => { clearTimeout(t); resolve(); };
+          video.onerror = () => { clearTimeout(t); reject(new Error('video error')); };
+          video.currentTime = times[i];
+        });
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        frameData.push({ time: times[i], timestamp: formatTime(times[i]), dataUrl: canvas.toDataURL('image/jpeg', 0.85) });
+      } catch (e) {
+        console.warn(`Visual scan skip at ${times[i]}s:`, e.message);
+      }
+      setVisualScanProgress({ current: i + 1, total: times.length, phase: 'extracting' });
+    }
+
+    if (frameData.length === 0) return [];
+
+    // Analyze in batches of 4 frames
+    const BATCH = 4;
+    const batches = [];
+    for (let i = 0; i < frameData.length; i += BATCH) batches.push(frameData.slice(i, i + BATCH));
+
+    setVisualScanProgress({ current: 0, total: batches.length, phase: 'analyzing' });
+    const findings = [];
+
+    for (let b = 0; b < batches.length; b++) {
+      if (cancelledRef.current) break;
+      const batch = batches[b];
+      const resized = await Promise.all(batch.map(f => resizeFrameForVision(f.dataUrl, 512)));
+
+      const imageContent = resized.map(dataUrl => ({
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: dataUrl.split(',')[1] },
+      }));
+
+      const timestamps = batch.map(f => f.timestamp).join(', ');
+      const textContent = {
+        type: 'text',
+        text: `[VISUAL_CREDENTIAL_SCAN]\n\nAnalyze these ${batch.length} video frames captured at: ${timestamps}.\n\nFor EACH frame (in order), check for ANY visible authentication credentials or sensitive access data:\n- Login screens or authentication dialogs\n- Visible usernames, user IDs, email addresses\n- Password fields (even masked fields are a risk indicator)\n- Transaction codes, client numbers, access codes\n- System configuration with sensitive identifiers\n\nRespond with ONLY a valid JSON array, exactly ${batch.length} entries:\n[\n  {"frame_index":0,"timestamp":"${batch[0]?.timestamp}","credentials_visible":false,"visual_risk":"NONE","system_detected":null,"findings":[],"evidence_rating":"NONE","recommendation":null}\n]\n\nvisual_risk: HIGH (credential text visible), MEDIUM (auth UI present with fields), LOW (possible context), NONE\nevidence_rating: STRONG / MODERATE / WEAK / NONE`,
+      };
+
+      try {
+        const raw = await callClaude([{ role: 'user', content: [textContent, ...imageContent] }], apiKey, openAiApiKey);
+        let parsed = [];
+        try { parsed = JSON.parse(raw); }
+        catch { const m = raw.match(/\[[\s\S]*\]/); if (m) try { parsed = JSON.parse(m[0]); } catch {} }
+        if (Array.isArray(parsed)) {
+          parsed.forEach((result, idx) => {
+            if (result.credentials_visible || (result.visual_risk && result.visual_risk !== 'NONE')) {
+              findings.push({
+                ...result,
+                timestamp: batch[idx]?.timestamp || result.timestamp,
+                time: batch[idx]?.time || 0,
+                dataUrl: batch[idx]?.dataUrl || '',
+              });
+            }
+          });
+        }
+      } catch (e) {
+        console.warn(`Visual scan batch ${b} failed:`, e);
+      }
+      setVisualScanProgress({ current: b + 1, total: batches.length, phase: 'analyzing' });
+    }
+
+    return findings;
+  }, [videoUrl, apiKey, openAiApiKey]);
+
   // ─── MAIN PIPELINE RUNNER ─────────────────────────────────────────────────
   const runPipeline = useCallback(async (method) => {
     cancelledRef.current = false;
@@ -1282,6 +1376,10 @@ export default function App() {
     setExtractedPreviewFrames([]);
     setVisualAnalysis(new Map());
     setVisualAnalysisProgress({ current: 0, total: 0 });
+    setVisualFindings([]);
+    setVisualScanProgress({ current: 0, total: 0, phase: 'extracting' });
+    setLeftPanelTab('audio');
+    setSelectedVisualIdx(null);
     setAnalysisResult(null);
     setFlagStatuses(new Map());
     setFlagNotes(new Map());
@@ -1364,11 +1462,17 @@ export default function App() {
       }
       setStepTimes(p => ({ ...p, 3: Date.now() - stepStartRef.current[3] }));
 
-      // ── Step 4: Visual frame analysis ──
+      // ── Step 4: Visual credential scan (independent full-video scan + per-flag deep analysis) ──
       setProcessingStep(4);
       stepStartRef.current[4] = Date.now();
-      if (method !== 'sample' && result.flags?.length > 0 && framesMap.size > 0) {
-        await analyzeFramesVisually(result.flags, framesMap);
+      if (method !== 'sample') {
+        // Independent full-video frame scan
+        const vFindings = await scanVideoFramesVisually();
+        setVisualFindings(vFindings);
+        // Deep analysis of frames around audio-flagged segments
+        if (result.flags?.length > 0 && framesMap.size > 0) {
+          await analyzeFramesVisually(result.flags, framesMap);
+        }
       }
       setStepTimes(p => ({ ...p, 4: Date.now() - stepStartRef.current[4] }));
 
@@ -1391,6 +1495,7 @@ export default function App() {
     analyzeTranscript,
     extractAllFrames,
     analyzeFramesVisually,
+    scanVideoFramesVisually,
     manualTranscript,
   ]);
 
@@ -1523,6 +1628,7 @@ export default function App() {
         visual_analysis:  visualAnalysis.get(f.id) || null,
         frameworks:      analysisResult.frameworks || [],
       })),
+      visual_scan_findings: visualFindings,
       remediation_recommendations: analysisResult.remediation || [],
       disclaimer: 'This report was generated with AI assistance. CredScan AI flags potential risks; the auditor renders final judgment.',
     };
@@ -1548,6 +1654,7 @@ export default function App() {
     flagNotes,
     extractedFrames,
     visualAnalysis,
+    visualFindings,
   ]);
 
   // ─── DERIVED STATE ────────────────────────────────────────────────────────
@@ -1838,7 +1945,7 @@ export default function App() {
       { num: 1, label: 'Transcribing audio', sublabel: step1Sublabel },
       { num: 2, label: 'Analyzing transcript', sublabel: 'Scanning for credential exposure risks with configured AI model' },
       { num: 3, label: 'Extracting frames', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `Processing ${analysisResult?.flags?.length || 0} flagged window${(analysisResult?.flags?.length || 0) !== 1 ? 's' : ''} (±15s around each flagged time)` },
-      { num: 4, label: 'Visual frame analysis', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `AI vision scan of extracted frames${visualAnalysisProgress.total > 0 ? ` — ${visualAnalysisProgress.current}/${visualAnalysisProgress.total} flags analyzed` : ''}` },
+      { num: 4, label: 'Visual credential scan', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : visualScanProgress.phase === 'analyzing' ? `Analyzing frame batches — ${visualScanProgress.current}/${visualScanProgress.total}` : visualScanProgress.total > 0 ? `Extracting sample frames — ${visualScanProgress.current}/${visualScanProgress.total}` : 'Scanning video frames for visible credentials…' },
       { num: 5, label: 'Compiling results', sublabel: 'Building audit workspace' },
     ];
 
@@ -2015,92 +2122,166 @@ export default function App() {
             width: 290, flexShrink: 0, borderRight: `1px solid ${T.border}`,
             display: 'flex', flexDirection: 'column', background: T.bgCard,
           }}>
-            {/* Panel header */}
-            <div style={{ padding: '14px 16px', borderBottom: `1px solid ${T.border}` }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight }}>
-                  Flagged Segments
-                  <span style={{
-                    marginLeft: 8, background: T.bgSurface, color: T.gold,
-                    borderRadius: 20, padding: '1px 8px', fontSize: 11, fontFamily: T.mono,
-                  }}>{flagCount}</span>
-                </div>
-                <RiskBadge risk={overallRisk} small />
-              </div>
-              {/* Filter + Sort */}
-              <div style={{ display: 'flex', gap: 6 }}>
-                <select value={filterRisk} onChange={e => setFilterRisk(e.target.value)}
-                  style={{ flex: 1, background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 5, color: T.text, padding: '5px 8px', fontSize: 11, fontFamily: T.serif, cursor: 'pointer', outline: 'none' }}>
-                  <option value="ALL">All risks</option>
-                  <option value="HIGH">HIGH only</option>
-                  <option value="MEDIUM">MEDIUM only</option>
-                  <option value="LOW">LOW only</option>
-                </select>
-                <select value={sortBy} onChange={e => setSortBy(e.target.value)}
-                  style={{ flex: 1, background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 5, color: T.text, padding: '5px 8px', fontSize: 11, fontFamily: T.serif, cursor: 'pointer', outline: 'none' }}>
-                  <option value="timestamp">Sort: Time</option>
-                  <option value="risk">Sort: Risk</option>
-                </select>
-              </div>
+            {/* Tab bar */}
+            <div style={{ display: 'flex', borderBottom: `1px solid ${T.border}`, flexShrink: 0 }}>
+              {[
+                { key: 'audio', label: `🎙 Audio (${flagCount})` },
+                { key: 'visual', label: `🖼 Visual (${visualFindings.length})` },
+              ].map(tab => (
+                <button
+                  key={tab.key}
+                  onClick={() => { setLeftPanelTab(tab.key); setSelectedVisualIdx(null); }}
+                  style={{
+                    flex: 1, padding: '10px 8px', background: 'none', border: 'none',
+                    borderBottom: leftPanelTab === tab.key ? `2px solid ${T.gold}` : '2px solid transparent',
+                    color: leftPanelTab === tab.key ? T.goldLight : T.textDim,
+                    fontSize: 12, fontFamily: T.serif, cursor: 'pointer', transition: 'color 0.15s',
+                  }}
+                >
+                  {tab.label}
+                </button>
+              ))}
             </div>
 
-            {/* Flag cards */}
-            <div style={{ flex: 1, overflowY: 'auto' }}>
-              {displayedFlags.length === 0 && (
-                <div style={{ padding: 20, textAlign: 'center', color: T.textDim, fontSize: 13 }}>
-                  No flags match the current filter.
+            {leftPanelTab === 'audio' ? (
+              <>
+                {/* Audio panel header */}
+                <div style={{ padding: '10px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: T.goldLight }}>
+                      Flagged Segments
+                    </div>
+                    <RiskBadge risk={overallRisk} small />
+                  </div>
+                  {/* Filter + Sort */}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <select value={filterRisk} onChange={e => setFilterRisk(e.target.value)}
+                      style={{ flex: 1, background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 5, color: T.text, padding: '5px 8px', fontSize: 11, fontFamily: T.serif, cursor: 'pointer', outline: 'none' }}>
+                      <option value="ALL">All risks</option>
+                      <option value="HIGH">HIGH only</option>
+                      <option value="MEDIUM">MEDIUM only</option>
+                      <option value="LOW">LOW only</option>
+                    </select>
+                    <select value={sortBy} onChange={e => setSortBy(e.target.value)}
+                      style={{ flex: 1, background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 5, color: T.text, padding: '5px 8px', fontSize: 11, fontFamily: T.serif, cursor: 'pointer', outline: 'none' }}>
+                      <option value="timestamp">Sort: Time</option>
+                      <option value="risk">Sort: Risk</option>
+                    </select>
+                  </div>
                 </div>
-              )}
-              {displayedFlags.map(flag => {
-                const isSelected = selectedFlagId === flag.id;
-                const status     = flagStatuses.get(flag.id) || 'unreviewed';
-                return (
-                  <div
-                    key={flag.id}
-                    onClick={() => setSelectedFlagId(flag.id)}
-                    style={{
-                      padding: '12px 16px',
-                      borderBottom: `1px solid ${T.border}`,
-                      background: isSelected ? T.bgHover : 'transparent',
-                      borderLeft: isSelected ? `3px solid ${T.gold}` : '3px solid transparent',
-                      cursor: 'pointer',
-                      transition: 'background 0.15s',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <RiskBadge risk={flag.risk_level} small />
-                      <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted }}>
-                        {flag.timestamp_start}–{flag.timestamp_end}
-                      </span>
+
+                {/* Flag cards */}
+                <div style={{ flex: 1, overflowY: 'auto' }}>
+                  {displayedFlags.length === 0 && (
+                    <div style={{ padding: 20, textAlign: 'center', color: T.textDim, fontSize: 13 }}>
+                      No flags match the current filter.
                     </div>
-                    <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 5 }}>
-                      {getCategoryLabel(flag.category)}
-                    </div>
-                    <div style={{ fontSize: 12, color: T.text, lineHeight: 1.45, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                      "{flag.text}"
-                    </div>
-                    {/* Status pill */}
-                    <div style={{ marginTop: 8 }}>
-                      <select
-                        value={status}
-                        onChange={e => { e.stopPropagation(); setFlagStatuses(prev => new Map(prev).set(flag.id, e.target.value)); }}
-                        onClick={e => e.stopPropagation()}
+                  )}
+                  {displayedFlags.map(flag => {
+                    const isSelected = selectedFlagId === flag.id;
+                    const status     = flagStatuses.get(flag.id) || 'unreviewed';
+                    return (
+                      <div
+                        key={flag.id}
+                        onClick={() => setSelectedFlagId(flag.id)}
                         style={{
-                          background: 'transparent', border: `1px solid ${getStatusColor(status)}50`,
-                          borderRadius: 4, color: getStatusColor(status), padding: '2px 6px',
-                          fontSize: 10, fontFamily: T.serif, cursor: 'pointer', outline: 'none', width: '100%',
+                          padding: '12px 16px',
+                          borderBottom: `1px solid ${T.border}`,
+                          background: isSelected ? T.bgHover : 'transparent',
+                          borderLeft: isSelected ? `3px solid ${T.gold}` : '3px solid transparent',
+                          cursor: 'pointer',
+                          transition: 'background 0.15s',
                         }}
                       >
-                        <option value="unreviewed">Unreviewed</option>
-                        <option value="confirmed">Confirmed Finding</option>
-                        <option value="false_positive">False Positive</option>
-                        <option value="needs_investigation">Needs Investigation</option>
-                      </select>
-                    </div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                          <RiskBadge risk={flag.risk_level} small />
+                          <span style={{ fontSize: 11, fontFamily: T.mono, color: T.textMuted }}>
+                            {flag.timestamp_start}–{flag.timestamp_end}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 5 }}>
+                          {getCategoryLabel(flag.category)}
+                        </div>
+                        <div style={{ fontSize: 12, color: T.text, lineHeight: 1.45, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                          "{flag.text}"
+                        </div>
+                        {/* Status pill */}
+                        <div style={{ marginTop: 8 }}>
+                          <select
+                            value={status}
+                            onChange={e => { e.stopPropagation(); setFlagStatuses(prev => new Map(prev).set(flag.id, e.target.value)); }}
+                            onClick={e => e.stopPropagation()}
+                            style={{
+                              background: 'transparent', border: `1px solid ${getStatusColor(status)}50`,
+                              borderRadius: 4, color: getStatusColor(status), padding: '2px 6px',
+                              fontSize: 10, fontFamily: T.serif, cursor: 'pointer', outline: 'none', width: '100%',
+                            }}
+                          >
+                            <option value="unreviewed">Unreviewed</option>
+                            <option value="confirmed">Confirmed Finding</option>
+                            <option value="false_positive">False Positive</option>
+                            <option value="needs_investigation">Needs Investigation</option>
+                          </select>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              /* Visual findings tab */
+              <div style={{ flex: 1, overflowY: 'auto' }}>
+                {visualFindings.length === 0 ? (
+                  <div style={{ padding: 24, textAlign: 'center', color: T.textDim, fontSize: 13 }}>
+                    <div style={{ fontSize: 28, marginBottom: 8 }}>🖼</div>
+                    No visual credential findings detected.
                   </div>
-                );
-              })}
-            </div>
+                ) : (
+                  visualFindings.map((finding, idx) => {
+                    const isSelected = selectedVisualIdx === idx;
+                    return (
+                      <div
+                        key={idx}
+                        onClick={() => setSelectedVisualIdx(idx)}
+                        style={{
+                          padding: '10px 12px',
+                          borderBottom: `1px solid ${T.border}`,
+                          background: isSelected ? T.bgHover : 'transparent',
+                          borderLeft: isSelected ? `3px solid ${T.gold}` : '3px solid transparent',
+                          cursor: 'pointer',
+                          transition: 'background 0.15s',
+                          display: 'flex', gap: 10, alignItems: 'flex-start',
+                        }}
+                      >
+                        {finding.dataUrl && (
+                          <img
+                            src={finding.dataUrl}
+                            alt={finding.timestamp}
+                            style={{ width: 64, height: 36, objectFit: 'cover', borderRadius: 4, flexShrink: 0, border: `1px solid ${T.border}` }}
+                          />
+                        )}
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+                            <RiskBadge risk={finding.visual_risk} small />
+                            <span style={{ fontSize: 10, fontFamily: T.mono, color: T.textMuted }}>{finding.timestamp}</span>
+                          </div>
+                          {finding.system_detected && (
+                            <div style={{ fontSize: 11, color: T.goldLight, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {finding.system_detected}
+                            </div>
+                          )}
+                          {finding.findings?.length > 0 && (
+                            <div style={{ fontSize: 11, color: T.textMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {finding.findings[0]}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
           </div>
 
           {/* ── CENTER PANEL: Video + Frames ── */}
@@ -2184,7 +2365,37 @@ export default function App() {
 
             {/* Frame filmstrip */}
             <div style={{ flex: 1, overflowY: 'auto', background: T.bg, padding: 16 }}>
-              {selectedFlag ? (
+              {leftPanelTab === 'visual' && selectedVisualIdx !== null ? (() => {
+                const vf = visualFindings[selectedVisualIdx];
+                if (!vf) return null;
+                return (
+                  <>
+                    <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10 }}>
+                      Visual scan frame — {vf.timestamp}
+                    </div>
+                    {vf.dataUrl && (
+                      <div style={{ marginBottom: 12 }}>
+                        <img
+                          src={vf.dataUrl}
+                          alt={vf.timestamp}
+                          style={{ width: '100%', maxHeight: 220, objectFit: 'contain', borderRadius: 8, border: `1px solid ${T.gold}40`, background: '#000' }}
+                        />
+                        <div style={{ textAlign: 'center', marginTop: 4, fontSize: 11, fontFamily: T.mono, color: T.gold }}>
+                          {vf.timestamp}
+                        </div>
+                      </div>
+                    )}
+                    {vf.findings?.length > 0 && (
+                      <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 6, padding: '10px 12px' }}>
+                        <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Visual Evidence</div>
+                        <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, color: T.text, lineHeight: 1.7 }}>
+                          {vf.findings.map((f, i) => <li key={i}>{f}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                  </>
+                );
+              })() : selectedFlag ? (
                 <>
                   <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10 }}>
                     Extracted frames — Flag #{selectedFlag.id} · {selectedFlag.timestamp_start}–{selectedFlag.timestamp_end}
@@ -2243,7 +2454,97 @@ export default function App() {
             width: 280, flexShrink: 0, borderLeft: `1px solid ${T.border}`,
             background: T.bgCard, display: 'flex', flexDirection: 'column', overflow: 'hidden',
           }}>
-            {selectedFlag ? (
+            {leftPanelTab === 'visual' && selectedVisualIdx !== null ? (() => {
+              const vf = visualFindings[selectedVisualIdx];
+              if (!vf) return null;
+              return (
+                <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+                  {/* Risk badge */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                    <RiskBadge risk={vf.visual_risk} />
+                    <span style={{ fontSize: 11, color: T.textMuted }}>Visual Finding #{selectedVisualIdx + 1}</span>
+                  </div>
+
+                  {/* Credentials visible badge */}
+                  {vf.credentials_visible && (
+                    <div style={{ marginBottom: 12 }}>
+                      <span style={{ fontSize: 10, color: T.redLight, background: T.redDim, padding: '2px 8px', borderRadius: 3, fontFamily: T.mono, border: `1px solid ${T.red}40` }}>
+                        CREDENTIALS VISIBLE
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Timestamp */}
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 14 }}>
+                    <span style={{ fontSize: 12, color: T.textDim }}>Timestamp:</span>
+                    <span style={{ fontFamily: T.mono, fontSize: 12, color: T.goldLight }}>{vf.timestamp}</span>
+                    {videoUrl && (
+                      <button onClick={() => { if (videoRef.current) videoRef.current.currentTime = vf.time || 0; }}
+                        style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 4, padding: '2px 6px', color: T.textMuted, cursor: 'pointer', fontSize: 10 }}>
+                        ▶ Jump
+                      </button>
+                    )}
+                  </div>
+
+                  {/* System detected */}
+                  {vf.system_detected && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.08em' }}>System Detected</div>
+                      <div style={{ fontSize: 13, color: T.goldLight }}>{vf.system_detected}</div>
+                    </div>
+                  )}
+
+                  {/* Evidence rating */}
+                  <div style={{ marginBottom: 14, display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <span style={{ fontSize: 11, color: T.textDim }}>Evidence rating:</span>
+                    <span style={{
+                      fontFamily: T.mono, fontSize: 10,
+                      color: vf.evidence_rating === 'STRONG' ? T.redLight : vf.evidence_rating === 'MODERATE' ? T.amberLight : T.textMuted,
+                      background: getRiskBg(vf.evidence_rating === 'STRONG' ? 'HIGH' : vf.evidence_rating === 'MODERATE' ? 'MEDIUM' : 'LOW'),
+                      padding: '1px 6px', borderRadius: 3,
+                    }}>
+                      {vf.evidence_rating || 'NONE'}
+                    </span>
+                  </div>
+
+                  {/* Findings list */}
+                  {vf.findings?.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Findings</div>
+                      <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, color: T.text, lineHeight: 1.7 }}>
+                        {vf.findings.map((f, i) => <li key={i}>{f}</li>)}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Recommendation */}
+                  {vf.recommendation && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Recommendation</div>
+                      <div style={{ fontSize: 12, color: T.text, lineHeight: 1.6, fontStyle: 'italic' }}>{vf.recommendation}</div>
+                    </div>
+                  )}
+
+                  <div style={{ height: 1, background: T.border, margin: '14px 0' }} />
+
+                  {/* Ask AI */}
+                  <Btn variant="outline" style={{ width: '100%', justifyContent: 'center', marginBottom: 8 }}
+                    onClick={() => {
+                      const msg = `I have a visual finding at ${vf.timestamp} in the video. Visual risk: ${vf.visual_risk}. System detected: ${vf.system_detected || 'unknown'}. Findings: ${(vf.findings || []).join('; ')}. Recommendation: ${vf.recommendation || 'none'}. Please help me assess this finding and suggest remediation steps.`;
+                      setChatMessages(prev => [...prev, { role: 'user', content: msg }]);
+                      setMode('chat');
+                    }}>
+                    <ChatIcon size={13} /> Ask AI about this
+                  </Btn>
+                  {videoUrl && (
+                    <Btn variant="ghost" style={{ width: '100%', justifyContent: 'center' }}
+                      onClick={() => { if (videoRef.current) videoRef.current.currentTime = vf.time || 0; }}>
+                      ▶ Jump to timestamp
+                    </Btn>
+                  )}
+                </div>
+              );
+            })() : selectedFlag ? (
               <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
                 {/* Risk + category */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
