@@ -714,7 +714,8 @@ const callClaude = async (messages, apiKey, openAiApiKey = '') => {
       'Content-Type': 'application/json',
       'x-api-key': key,
       'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-allow-browser': 'true',
+      // Required by the Anthropic API for browser-origin (CORS) requests.
+      'anthropic-dangerous-direct-browser-access': 'true',
     };
     const body = JSON.stringify({
       model: 'claude-sonnet-4-20250514',
