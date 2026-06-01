@@ -977,6 +977,11 @@ export default function App() {
   const videoRef        = useRef(null);
   const hiddenVideoRef  = useRef(null);
   const fileInputRef    = useRef(null);
+  // Synchronous mirrors of the loaded video file/url so the pipeline can read
+  // them immediately after upload without waiting for a React re-render
+  // (avoids a stale-closure race where transcription/scan see the old values).
+  const videoFileRef    = useRef(null);
+  const videoUrlRef     = useRef('');
   const chatEndRef      = useRef(null);
   const chatInputRef    = useRef(null);
   const recognitionRef  = useRef(null);
@@ -1031,7 +1036,8 @@ export default function App() {
     video.defaultMuted = true;
     video.volume = 0;
     video.preload = 'auto';
-    if (videoUrl && video.src !== videoUrl) video.src = videoUrl;
+    const activeUrl = videoUrlRef.current || videoUrl;
+    if (activeUrl && video.src !== activeUrl) video.src = activeUrl;
     video.load();
     await waitForVideoReady(video);
     if (video.error) throw new Error(getVideoSourceErrorMessage(video));
@@ -1117,11 +1123,12 @@ export default function App() {
     });
   }, [transcriptionLanguage, videoUrl]);
   const startOpenAITranscription = useCallback(async () => {
-    if (!videoFile) throw new Error('No video file available for OpenAI transcription.');
+    const file = videoFileRef.current || videoFile;
+    if (!file) throw new Error('No video file available for OpenAI transcription.');
     setTranscriptionProgress(15);
 
     const languageTag = transcriptionLanguage === 'auto' ? 'auto' : transcriptionLanguage;
-    const result = await transcribeWithOpenAI(videoFile, openAiApiKey, languageTag);
+    const result = await transcribeWithOpenAI(file, openAiApiKey, languageTag);
 
     setResolvedTranscriptionLanguage(
       result.language ? String(result.language) : (transcriptionLanguage === 'auto' ? 'auto' : transcriptionLanguage)
@@ -1179,7 +1186,10 @@ export default function App() {
   // ─── PIPELINE: Step 3 — Frame extraction ─────────────────────────────────
   const extractAllFrames = useCallback(async (flags) => {
     const video = hiddenVideoRef.current;
-    if (!video || !videoUrl) return new Map();
+    const activeUrl = videoUrlRef.current || videoUrl;
+    if (!video || !activeUrl) return new Map();
+    if (activeUrl && video.src !== activeUrl) video.src = activeUrl;
+    try { await waitForVideoReady(video); } catch { return new Map(); }
 
     const priorityOrder = { CRITICAL: 0, HIGH: 1, STANDARD: 2 };
     const sorted = [...flags].sort((a, b) =>
@@ -1276,11 +1286,12 @@ export default function App() {
   // ─── PIPELINE: Full-video visual credential scan ──────────────────────────
   const scanVideoFramesVisually = useCallback(async () => {
     const video = hiddenVideoRef.current;
-    if (!video || !videoUrl) return [];
+    const activeUrl = videoUrlRef.current || videoUrl;
+    if (!video || !activeUrl) return [];
 
     // Make sure the hidden video is loaded — frame extraction (Step 3) may have
     // been skipped (e.g. no audio flags), so the element may not be warmed up yet.
-    if (video.src !== videoUrl) video.src = videoUrl;
+    if (video.src !== activeUrl) video.src = activeUrl;
     try {
       await waitForVideoReady(video);
     } catch (e) {
@@ -1514,6 +1525,9 @@ export default function App() {
   // ─── VIDEO LOAD ───────────────────────────────────────────────────────────
   const handleVideoLoad = useCallback((file) => {
     const url = URL.createObjectURL(file);
+    // Set refs synchronously so a pipeline started in the same tick sees them.
+    videoFileRef.current = file;
+    videoUrlRef.current = url;
     setVideoFile(file);
     setVideoUrl(prev => {
       if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);

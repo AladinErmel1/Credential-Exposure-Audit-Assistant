@@ -3,3 +3,10 @@ dist/
 .env
 *.local
 .claude/
+
+# Local test media — don't commit large binaries
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
