@@ -539,6 +539,32 @@ const decodeVideoAudioForWhisper = async (videoFile) => {
   return new File([wavBlob], `${baseName}.whisper.wav`, { type: 'audio/wav' });
 };
 
+const toOpenAIContent = (content) => {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content;
+  return content.map(part => {
+    if (part.type === 'text') return { type: 'text', text: part.text };
+    if (part.type === 'image' && part.source?.type === 'base64') {
+      return { type: 'image_url', image_url: { url: `data:${part.source.media_type};base64,${part.source.data}`, detail: 'low' } };
+    }
+    return part;
+  });
+};
+
+const resizeFrameForVision = (dataUrl, maxWidth = 512) => new Promise(resolve => {
+  const img = new Image();
+  img.onload = () => {
+    const ratio = Math.min(1, maxWidth / img.width);
+    const c = document.createElement('canvas');
+    c.width = Math.floor(img.width * ratio);
+    c.height = Math.floor(img.height * ratio);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    resolve(c.toDataURL('image/jpeg', 0.7));
+  };
+  img.onerror = () => resolve(dataUrl);
+  img.src = dataUrl;
+});
+
 const callOpenAIChat = async (messages, openAiApiKey = '') => {
   const resolvedKey = openAiApiKey || getOpenAIKeyFromEnv();
   const model = getOpenAIModel();
@@ -567,7 +593,7 @@ const callOpenAIChat = async (messages, openAiApiKey = '') => {
           temperature: 0.2,
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
-            ...messages.map((m) => ({ role: m.role, content: m.content })),
+            ...messages.map((m) => ({ role: m.role, content: toOpenAIContent(m.content) })),
           ],
         }),
       });
@@ -939,6 +965,8 @@ export default function App() {
   const [playbackRate, setPlaybackRate]   = useState(1);
   const [extractedPreviewFrames, setExtractedPreviewFrames] = useState([]);
   const [showFrameIndex, setShowFrameIndex] = useState(0);
+  const [visualAnalysis, setVisualAnalysis] = useState(new Map());
+  const [visualAnalysisProgress, setVisualAnalysisProgress] = useState({ current: 0, total: 0 });
 
   // Refs
   const videoRef        = useRef(null);
@@ -1146,7 +1174,7 @@ export default function App() {
   // ─── PIPELINE: Step 3 — Frame extraction ─────────────────────────────────
   const extractAllFrames = useCallback(async (flags) => {
     const video = hiddenVideoRef.current;
-    if (!video || !videoUrl) return;
+    if (!video || !videoUrl) return new Map();
 
     const priorityOrder = { CRITICAL: 0, HIGH: 1, STANDARD: 2 };
     const sorted = [...flags].sort((a, b) =>
@@ -1154,6 +1182,7 @@ export default function App() {
     );
 
     setFrameExtractionProgress({ current: 0, total: sorted.length });
+    const framesMap = new Map();
 
     for (let i = 0; i < sorted.length; i++) {
       if (cancelledRef.current) break;
@@ -1165,15 +1194,79 @@ export default function App() {
 
       try {
         const frames = await extractFrames(video, start, end, 1);
+        framesMap.set(flag.id, frames);
         setExtractedFrames(prev => new Map(prev).set(flag.id, frames));
-        // Show first frame in processing preview
         if (frames[0]) setExtractedPreviewFrames(prev => [...prev, frames[0]]);
       } catch (e) {
         console.warn(`Frame extraction failed for flag ${flag.id}:`, e);
       }
       setFrameExtractionProgress({ current: i + 1, total: sorted.length });
     }
+    return framesMap;
   }, [videoUrl]);
+
+  // ─── PIPELINE: Step 4 — Visual frame analysis ────────────────────────────
+  const analyzeFramesVisually = useCallback(async (flags, framesMap) => {
+    const prioritized = flags.filter(f =>
+      (f.frame_extraction_priority === 'CRITICAL' || f.frame_extraction_priority === 'HIGH') &&
+      (framesMap.get(f.id) || []).length > 0
+    );
+
+    setVisualAnalysisProgress({ current: 0, total: prioritized.length });
+    if (prioritized.length === 0) return;
+
+    for (let i = 0; i < prioritized.length; i++) {
+      if (cancelledRef.current) break;
+      const flag = prioritized[i];
+      const frames = framesMap.get(flag.id) || [];
+
+      // Pick up to 3 evenly-spaced frames
+      const picks = [];
+      if (frames.length <= 3) {
+        picks.push(...frames);
+      } else {
+        const step = (frames.length - 1) / 2;
+        picks.push(frames[0], frames[Math.round(step)], frames[frames.length - 1]);
+      }
+
+      const resized = await Promise.all(picks.map(f => resizeFrameForVision(f.dataUrl, 512)));
+
+      const imageContent = resized.map(dataUrl => ({
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: dataUrl.split(',')[1] },
+      }));
+
+      const textContent = {
+        type: 'text',
+        text: `[VISUAL_FRAME_ANALYSIS]\n\nAnalyze these ${resized.length} video frame(s) from timestamp ${flag.timestamp_start}–${flag.timestamp_end}.\n\nThe audio transcript for this segment flagged: "${flag.text}"\nAudio risk: ${flag.risk_level} — ${flag.explanation}\n\nExamine the frames for any VISIBLE credentials, login screens, password fields, usernames, authentication dialogs, or sensitive system data.\n\nRespond with ONLY a valid JSON object:\n{\n  "visual_risk": "HIGH",\n  "credentials_visible": true,\n  "evidence_rating": "STRONG",\n  "system_detected": "SAP GUI Login Screen",\n  "findings": ["Username field shows text", "Password field visible"],\n  "recommendation": "Redact or blur the login screen before publishing"\n}\n\nRules:\n- visual_risk: HIGH/MEDIUM/LOW/NONE based on what is VISUALLY present\n- credentials_visible: true if ANY credential-related UI or text is visible\n- evidence_rating: STRONG (clear text) / MODERATE (partially visible/blurred) / WEAK (suggested but unclear) / NONE\n- system_detected: name the application if identifiable, else null\n- findings: specific visual observations (empty array if nothing found)\n- recommendation: specific remediation action`,
+      };
+
+      try {
+        const raw = await callClaude(
+          [{ role: 'user', content: [textContent, ...imageContent] }],
+          apiKey,
+          openAiApiKey
+        );
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          const m = raw.match(/\{[\s\S]*\}/);
+          parsed = m
+            ? JSON.parse(m[0])
+            : { visual_risk: 'NONE', credentials_visible: false, evidence_rating: 'NONE', findings: [], recommendation: 'Could not parse visual analysis response.' };
+        }
+        setVisualAnalysis(prev => new Map(prev).set(flag.id, parsed));
+      } catch (e) {
+        console.warn(`Visual analysis failed for flag ${flag.id}:`, e);
+        setVisualAnalysis(prev => new Map(prev).set(flag.id, {
+          visual_risk: 'NONE', credentials_visible: false, evidence_rating: 'NONE', findings: [], error: e.message,
+        }));
+      }
+
+      setVisualAnalysisProgress({ current: i + 1, total: prioritized.length });
+    }
+  }, [apiKey, openAiApiKey]);
 
   // ─── MAIN PIPELINE RUNNER ─────────────────────────────────────────────────
   const runPipeline = useCallback(async (method) => {
@@ -1187,6 +1280,8 @@ export default function App() {
     setTranscript([]);
     setExtractedFrames(new Map());
     setExtractedPreviewFrames([]);
+    setVisualAnalysis(new Map());
+    setVisualAnalysisProgress({ current: 0, total: 0 });
     setAnalysisResult(null);
     setFlagStatuses(new Map());
     setFlagNotes(new Map());
@@ -1263,13 +1358,22 @@ export default function App() {
       // ── Step 3: Frame extraction ──
       setProcessingStep(3);
       stepStartRef.current[3] = Date.now();
+      let framesMap = new Map();
       if (method !== 'sample' && result.flags?.length > 0) {
-        await extractAllFrames(result.flags);
+        framesMap = await extractAllFrames(result.flags);
       }
       setStepTimes(p => ({ ...p, 3: Date.now() - stepStartRef.current[3] }));
 
-      // ── Step 4: Done ──
+      // ── Step 4: Visual frame analysis ──
       setProcessingStep(4);
+      stepStartRef.current[4] = Date.now();
+      if (method !== 'sample' && result.flags?.length > 0 && framesMap.size > 0) {
+        await analyzeFramesVisually(result.flags, framesMap);
+      }
+      setStepTimes(p => ({ ...p, 4: Date.now() - stepStartRef.current[4] }));
+
+      // ── Step 5: Done ──
+      setProcessingStep(5);
       await new Promise(r => setTimeout(r, 800));
 
       if (!cancelledRef.current) {
@@ -1286,6 +1390,7 @@ export default function App() {
     parseManualTranscript,
     analyzeTranscript,
     extractAllFrames,
+    analyzeFramesVisually,
     manualTranscript,
   ]);
 
@@ -1415,6 +1520,7 @@ export default function App() {
         auditor_status:  flagStatuses.get(f.id) || 'unreviewed',
         auditor_notes:   flagNotes.get(f.id) || '',
         frames_extracted: (extractedFrames.get(f.id) || []).length,
+        visual_analysis:  visualAnalysis.get(f.id) || null,
         frameworks:      analysisResult.frameworks || [],
       })),
       remediation_recommendations: analysisResult.remediation || [],
@@ -1441,6 +1547,7 @@ export default function App() {
     flagStatuses,
     flagNotes,
     extractedFrames,
+    visualAnalysis,
   ]);
 
   // ─── DERIVED STATE ────────────────────────────────────────────────────────
@@ -1731,7 +1838,8 @@ export default function App() {
       { num: 1, label: 'Transcribing audio', sublabel: step1Sublabel },
       { num: 2, label: 'Analyzing transcript', sublabel: 'Scanning for credential exposure risks with configured AI model' },
       { num: 3, label: 'Extracting frames', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `Processing ${analysisResult?.flags?.length || 0} flagged window${(analysisResult?.flags?.length || 0) !== 1 ? 's' : ''} (±15s around each flagged time)` },
-      { num: 4, label: 'Compiling results', sublabel: 'Building audit workspace' },
+      { num: 4, label: 'Visual frame analysis', sublabel: isSampleMode ? 'Skipped (no video in sample mode)' : `AI vision scan of extracted frames${visualAnalysisProgress.total > 0 ? ` — ${visualAnalysisProgress.current}/${visualAnalysisProgress.total} flags analyzed` : ''}` },
+      { num: 5, label: 'Compiling results', sublabel: 'Building audit workspace' },
     ];
 
     return (
@@ -2197,6 +2305,49 @@ export default function App() {
                     {selectedFlag.frame_extraction_priority}
                   </span>
                 </div>
+
+                {/* Visual Analysis */}
+                {visualAnalysis.get(selectedFlag.id) && (() => {
+                  const va = visualAnalysis.get(selectedFlag.id);
+                  return (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Visual Analysis</div>
+                      <div style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '10px 12px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 7, flexWrap: 'wrap' }}>
+                          <RiskBadge risk={va.visual_risk} small />
+                          {va.credentials_visible && (
+                            <span style={{ fontSize: 10, color: T.redLight, background: T.redDim, padding: '1px 6px', borderRadius: 3, fontFamily: T.mono, border: `1px solid ${T.red}40` }}>
+                              CREDENTIALS VISIBLE
+                            </span>
+                          )}
+                        </div>
+                        {va.system_detected && (
+                          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 5 }}>
+                            System: <span style={{ color: T.goldLight }}>{va.system_detected}</span>
+                          </div>
+                        )}
+                        <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+                          <span style={{ fontSize: 10, color: T.textDim }}>Evidence:</span>
+                          <span style={{
+                            fontSize: 10, fontFamily: T.mono,
+                            color: va.evidence_rating === 'STRONG' ? T.redLight : va.evidence_rating === 'MODERATE' ? T.amberLight : T.textMuted,
+                          }}>{va.evidence_rating || 'N/A'}</span>
+                        </div>
+                        {va.findings?.length > 0 && (
+                          <ul style={{ margin: '0 0 6px', paddingLeft: 14, fontSize: 11, color: T.text, lineHeight: 1.6 }}>
+                            {va.findings.map((f, i) => <li key={i}>{f}</li>)}
+                          </ul>
+                        )}
+                        {va.recommendation && (
+                          <div style={{ fontSize: 11, color: T.textMuted, fontStyle: 'italic' }}>{va.recommendation}</div>
+                        )}
+                        {va.error && (
+                          <div style={{ fontSize: 10, color: T.redLight, marginTop: 4 }}>Analysis error: {va.error}</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Frameworks */}
                 {analysisResult?.frameworks?.length > 0 && (
