@@ -462,110 +462,82 @@ const extractOpenAIChatContent = (content) => {
   return '';
 };
 
-const getSupportedAudioRecorderMimeType = () => {
-  if (typeof MediaRecorder === 'undefined') return '';
-  const preferred = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-  ];
-  for (const type of preferred) {
-    try {
-      if (MediaRecorder.isTypeSupported(type)) return type;
-    } catch {}
-  }
-  return '';
+// WAV encoder helpers used by decodeVideoAudioForWhisper
+const _wavWriteStr = (view, offset, str) => {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
 };
 
-const extractAudioTrackForWhisper = async (videoFile) => new Promise((resolve, reject) => {
-  if (typeof document === 'undefined') {
-    reject(new Error('Audio extraction is only available in browser runtime.'));
-    return;
+const _encodeMonoWAV = (samples, sampleRate) => {
+  const dataLen = samples.length * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const v = new DataView(buf);
+  _wavWriteStr(v, 0, 'RIFF');
+  v.setUint32(4, 36 + dataLen, true);
+  _wavWriteStr(v, 8, 'WAVE');
+  _wavWriteStr(v, 12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);   // PCM
+  v.setUint16(22, 1, true);   // mono
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  _wavWriteStr(v, 36, 'data');
+  v.setUint32(40, dataLen, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    off += 2;
   }
-  const streamCapture = HTMLMediaElement.prototype.captureStream || HTMLMediaElement.prototype.mozCaptureStream;
-  if (!streamCapture) {
-    reject(new Error('This browser does not support media stream capture for large-file transcription.'));
-    return;
+  return new Blob([buf], { type: 'audio/wav' });
+};
+
+// Decode the video file's audio track using the Web Audio API (no real-time playback
+// required — OfflineAudioContext renders at maximum speed), then encode as 16 kHz
+// mono WAV suitable for the Whisper API.
+const decodeVideoAudioForWhisper = async (videoFile) => {
+  const TARGET_SR = 16000;
+
+  // Read the whole file into memory. We .slice() to avoid detaching the buffer.
+  const arrayBuffer = await videoFile.arrayBuffer();
+
+  const decodeCtx = new AudioContext();
+  let decoded;
+  try {
+    decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+  } catch (e) {
+    throw new Error(
+      `Browser could not decode the audio from "${videoFile.name}". ` +
+      `Try converting to MP4 or WebM, or switch to the browser speech engine. (${e.message})`
+    );
+  } finally {
+    decodeCtx.close().catch(() => {});
   }
 
-  const objectUrl = URL.createObjectURL(videoFile);
-  const video = document.createElement('video');
-  video.src = objectUrl;
-  video.preload = 'auto';
-  video.muted = true;
-  video.playsInline = true;
+  // Resample to 16 kHz mono via OfflineAudioContext (runs faster than real-time).
+  const numFrames = Math.ceil(decoded.duration * TARGET_SR);
+  const offCtx = new OfflineAudioContext(1, numFrames, TARGET_SR);
+  const src = offCtx.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offCtx.destination);
+  src.start(0);
+  const rendered = await offCtx.startRendering();
+  const samples = rendered.getChannelData(0);
 
-  let done = false;
-  let stream = null;
-  let recorder = null;
-  const chunks = [];
-  const timeout = setTimeout(() => {
-    finalize(new Error('Timed out while extracting audio for Whisper.'));
-  }, 120000);
+  const wavBlob = _encodeMonoWAV(samples, TARGET_SR);
 
-  const cleanup = () => {
-    clearTimeout(timeout);
-    URL.revokeObjectURL(objectUrl);
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
-    }
-  };
+  if (wavBlob.size > OPENAI_TRANSCRIPTION_MAX_BYTES) {
+    const sizeMB = (wavBlob.size / 1048576).toFixed(1);
+    throw new Error(
+      `Audio is ${sizeMB} MB at 16 kHz mono and still exceeds the 25 MB Whisper limit. ` +
+      `Try a shorter clip or switch to the browser speech engine.`
+    );
+  }
 
-  const finalize = (err, file) => {
-    if (done) return;
-    done = true;
-    cleanup();
-    if (err) reject(err);
-    else resolve(file);
-  };
-
-  video.onerror = () => finalize(new Error('Failed to decode video while preparing audio for Whisper.'));
-
-  video.onloadedmetadata = async () => {
-    try {
-      stream = streamCapture.call(video);
-      const audioTracks = stream.getAudioTracks();
-      if (!audioTracks.length) {
-        finalize(new Error('No audio track found in video for Whisper transcription.'));
-        return;
-      }
-
-      const audioStream = new MediaStream(audioTracks);
-      const mimeType = getSupportedAudioRecorderMimeType();
-      const recOptions = mimeType
-        ? { mimeType, audioBitsPerSecond: 64000 }
-        : { audioBitsPerSecond: 64000 };
-
-      recorder = new MediaRecorder(audioStream, recOptions);
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
-      };
-      recorder.onerror = () => finalize(new Error('MediaRecorder failed while extracting audio for Whisper.'));
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
-        if (!blob.size) {
-          finalize(new Error('Extracted audio blob is empty.'));
-          return;
-        }
-        const fileNameBase = (videoFile.name || 'audio').replace(/\.[^.]+$/, '');
-        const extension = blob.type.includes('mp4') ? 'm4a' : 'webm';
-        const audioFile = new File([blob], `${fileNameBase}.whisper.${extension}`, { type: blob.type || 'audio/webm' });
-        finalize(null, audioFile);
-      };
-
-      video.currentTime = 0;
-      recorder.start(1000);
-      await video.play();
-    } catch (err) {
-      finalize(new Error(`Could not prepare compact audio for Whisper: ${err?.message || err}`));
-      return;
-    }
-
-    video.onended = () => {
-      if (recorder && recorder.state === 'recording') recorder.stop();
-    };
-  };
-});
+  const baseName = (videoFile.name || 'audio').replace(/\.[^.]+$/, '');
+  return new File([wavBlob], `${baseName}.whisper.wav`, { type: 'audio/wav' });
+};
 
 const callOpenAIChat = async (messages, openAiApiKey = '') => {
   const resolvedKey = openAiApiKey || getOpenAIKeyFromEnv();
@@ -632,12 +604,12 @@ const transcribeWithOpenAI = async (file, openAiApiKey = '', languageTag = 'auto
   const model = getOpenAITranscriptionModel();
   const endpoints = getOpenAITranscriptionEndpoints();
   const language = normalizeLanguageForOpenAI(languageTag);
+  // For files over 25 MB send a decoded WAV instead of the raw video.
+  // decodeVideoAudioForWhisper uses OfflineAudioContext so it runs in seconds,
+  // not in real-time (unlike the old captureStream approach).
   let uploadFile = file;
   if (file.size > OPENAI_TRANSCRIPTION_MAX_BYTES) {
-    uploadFile = await extractAudioTrackForWhisper(file);
-    if (uploadFile.size > OPENAI_TRANSCRIPTION_MAX_BYTES) {
-      throw new Error('OpenAI Whisper upload limit exceeded after audio extraction. Use browser transcription for this video.');
-    }
+    uploadFile = await decodeVideoAudioForWhisper(file);
   }
   let lastError;
 
@@ -1244,9 +1216,8 @@ export default function App() {
             const likelySizeOrCodecIssue =
               openMsg.includes('upload limit') ||
               openMsg.includes('Maximum content size limit') ||
-              openMsg.includes('media stream capture') ||
-              openMsg.includes('decode video') ||
-              openMsg.includes('No audio track found');
+              openMsg.includes('still exceeds the 25 MB') ||
+              openMsg.includes('could not decode the audio');
             if (!likelySizeOrCodecIssue) throw openErr;
 
             try {
