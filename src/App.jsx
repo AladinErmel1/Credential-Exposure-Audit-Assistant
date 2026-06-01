@@ -1276,6 +1276,17 @@ export default function App() {
   const scanVideoFramesVisually = useCallback(async () => {
     const video = hiddenVideoRef.current;
     if (!video || !videoUrl) return [];
+
+    // Make sure the hidden video is loaded — frame extraction (Step 3) may have
+    // been skipped (e.g. no audio flags), so the element may not be warmed up yet.
+    if (video.src !== videoUrl) video.src = videoUrl;
+    try {
+      await waitForVideoReady(video);
+    } catch (e) {
+      console.warn('Visual scan: video not ready:', e.message);
+      return [];
+    }
+
     const duration = video.duration;
     if (!duration || duration <= 0 || !isFinite(duration)) return [];
 
