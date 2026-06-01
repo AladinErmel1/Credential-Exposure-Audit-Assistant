@@ -199,7 +199,6 @@ const renderMarkdown = (text) => {
 
     // Code block
     if (line.startsWith('```')) {
-      const lang = line.slice(3).trim();
       const codeLines = [];
       i++;
       while (i < lines.length && !lines[i].startsWith('```')) {
@@ -932,7 +931,7 @@ export default function App() {
   const [transcript, setTranscript]                   = useState([]);
   const [transcriptionProgress, setTranscriptionProgress] = useState(0);
   const [transcriptionMethod, setTranscriptionMethod] = useState('openai');
-  const [transcriptionEngine, setTranscriptionEngine] = useState('openai');
+  const [transcriptionEngine, setTranscriptionEngine] = useState('auto');
   const [transcriptionLanguage, setTranscriptionLanguage] = useState('auto');
   const [resolvedTranscriptionLanguage, setResolvedTranscriptionLanguage] = useState(resolveAutoTranscriptionLanguage);
   const [analysisResult, setAnalysisResult]           = useState(null);
@@ -1213,6 +1212,7 @@ export default function App() {
     setProcessingStep(1);
     setTranscriptionProgress(0);
     setLiveTranscript('');
+    setTranscript([]);
     setExtractedFrames(new Map());
     setExtractedPreviewFrames([]);
     setAnalysisResult(null);
@@ -1322,7 +1322,10 @@ export default function App() {
   const handleVideoLoad = useCallback((file) => {
     const url = URL.createObjectURL(file);
     setVideoFile(file);
-    setVideoUrl(url);
+    setVideoUrl(prev => {
+      if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+      return url;
+    });
     setUploadError('');
 
     // Thumbnail from first frame
@@ -1406,11 +1409,10 @@ export default function App() {
   // ─── EXPORT ───────────────────────────────────────────────────────────────
   const exportReport = useCallback(() => {
     if (!analysisResult) return;
-    const totalFlags = analysisResult.total_flags || 0;
+    const totalFlags = analysisResult.flags?.length ?? analysisResult.total_flags ?? 0;
     const confirmed  = [...flagStatuses.values()].filter(s => s === 'confirmed').length;
     const fp         = [...flagStatuses.values()].filter(s => s === 'false_positive').length;
     const ni         = [...flagStatuses.values()].filter(s => s === 'needs_investigation').length;
-    const unreviewed = totalFlags - [...flagStatuses.keys()].length + [...flagStatuses.values()].filter(s => s === 'unreviewed').length;
 
     const report = {
       report_title: 'CredScan AI — Credential Exposure Analysis Report',
@@ -1441,6 +1443,7 @@ export default function App() {
         ai_explanation:  f.explanation,
         auditor_status:  flagStatuses.get(f.id) || 'unreviewed',
         auditor_notes:   flagNotes.get(f.id) || '',
+        frames_extracted: (extractedFrames.get(f.id) || []).length,
         frameworks:      analysisResult.frameworks || [],
       })),
       remediation_recommendations: analysisResult.remediation || [],
@@ -1466,6 +1469,7 @@ export default function App() {
     resolvedTranscriptionLanguage,
     flagStatuses,
     flagNotes,
+    extractedFrames,
   ]);
 
   // ─── DERIVED STATE ────────────────────────────────────────────────────────
@@ -1486,10 +1490,12 @@ export default function App() {
     ? transcript.map((s) => `[${formatTime(s.start)}] ${s.text}`).join('\n')
     : '';
 
+  // Prefer the actual flags array length; fall back to the model-reported count.
+  const flagCount      = analysisResult?.flags?.length ?? analysisResult?.total_flags ?? 0;
   const statsConfirmed = [...flagStatuses.values()].filter(s => s === 'confirmed').length;
   const statsFP        = [...flagStatuses.values()].filter(s => s === 'false_positive').length;
   const statsNI        = [...flagStatuses.values()].filter(s => s === 'needs_investigation').length;
-  const statsUnreview  = (analysisResult?.total_flags || 0) - [...flagStatuses.values()].filter(s => s !== 'unreviewed').length;
+  const statsUnreview  = Math.max(0, flagCount - statsConfirmed - statsFP - statsNI);
 
 
   // ─── RENDER: WELCOME ─────────────────────────────────────────────────────
@@ -1594,7 +1600,7 @@ export default function App() {
               </div>
             </div>
             <div style={{ fontSize: 11, color: T.textDim, marginTop: 8 }}>
-              Only the text transcript is sent to the API — no video data is transmitted.
+              Video frames stay in your browser. The transcript is sent to your AI model for analysis. With the OpenAI Whisper engine, extracted audio is also sent to OpenAI; the browser engine keeps audio on-device.
             </div>
           </div>
         )}
@@ -1732,7 +1738,7 @@ export default function App() {
 
       {/* Privacy notice */}
       <div style={{ marginTop: 32, fontSize: 11, color: T.textDim, textAlign: 'center', maxWidth: 480 }}>
-        🔒 Privacy: Video files are processed entirely in your browser. Only the text transcript is sent to the Anthropic API for analysis. No video data is transmitted to any server.
+        🔒 Privacy: Video frames are extracted locally in your browser and never uploaded. The text transcript is sent to your configured AI model (Anthropic or OpenAI) for credential analysis. Note: when OpenAI Whisper is the active transcription engine, the extracted audio is sent to OpenAI to be transcribed — choose the browser engine to keep audio fully on-device.
       </div>
     </div>
   );
@@ -1938,7 +1944,7 @@ export default function App() {
                   <span style={{
                     marginLeft: 8, background: T.bgSurface, color: T.gold,
                     borderRadius: 20, padding: '1px 8px', fontSize: 11, fontFamily: T.mono,
-                  }}>{analysisResult?.total_flags || 0}</span>
+                  }}>{flagCount}</span>
                 </div>
                 <RiskBadge risk={overallRisk} small />
               </div>
@@ -2343,7 +2349,7 @@ export default function App() {
         }}>
           <div style={{ display: 'flex', gap: 20, fontSize: 12 }}>
             {[
-              { label: 'Total Flags', value: analysisResult?.total_flags || 0, color: T.goldLight },
+              { label: 'Total Flags', value: flagCount, color: T.goldLight },
               { label: 'Confirmed', value: statsConfirmed, color: T.red },
               { label: 'False Positive', value: statsFP, color: T.green },
               { label: 'Needs Investigation', value: statsNI, color: T.amber },
@@ -2401,7 +2407,7 @@ export default function App() {
             </div>
             <div>
               <div style={{ fontSize: 14, fontWeight: 600, color: T.goldLight }}>CredScan AI — Audit Assistant</div>
-              <div style={{ fontSize: 11, color: T.textDim }}>Powered by Claude · Human-in-the-loop audit support</div>
+              <div style={{ fontSize: 11, color: T.textDim }}>Powered by Claude (OpenAI fallback) · Human-in-the-loop audit support</div>
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -2427,7 +2433,7 @@ export default function App() {
               {videoFile?.name || 'Sample Transcript'}
             </div>
             <RiskBadge risk={analysisResult.overall_risk} small />
-            <div style={{ fontSize: 11, color: T.textMuted }}>{analysisResult.total_flags} flags · {statsConfirmed} confirmed</div>
+            <div style={{ fontSize: 11, color: T.textMuted }}>{flagCount} flags · {statsConfirmed} confirmed</div>
           </div>
         )}
 
