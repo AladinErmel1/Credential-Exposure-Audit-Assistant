@@ -1,4 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
+  Table, TableRow, TableCell, WidthType, BorderStyle, ShadingType,
+} from 'docx';
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are CredScan AI, a specialized audit assistant for internal auditors conducting IT and cybersecurity audits. Your specific domain is the detection of inadvertently exposed login credentials (usernames and passwords) within corporate training videos stored on internal or external networks.
@@ -972,6 +976,7 @@ export default function App() {
   const [visualScanProgress, setVisualScanProgress] = useState({ current: 0, total: 0, phase: 'extracting' });
   const [leftPanelTab, setLeftPanelTab]       = useState('audio');
   const [selectedVisualIdx, setSelectedVisualIdx] = useState(null);
+  const [isExporting, setIsExporting]         = useState(false);
 
   // Refs
   const videoRef        = useRef(null);
@@ -1613,61 +1618,174 @@ export default function App() {
     setTimeout(() => chatInputRef.current?.focus(), 100);
   }, [flagStatuses]);
 
-  // ─── EXPORT ───────────────────────────────────────────────────────────────
-  const exportReport = useCallback(() => {
+  // ─── EXPORT (Word .docx) ──────────────────────────────────────────────────
+  const exportReport = useCallback(async () => {
     if (!analysisResult) return;
-    const totalFlags = analysisResult.flags?.length ?? analysisResult.total_flags ?? 0;
-    const confirmed  = [...flagStatuses.values()].filter(s => s === 'confirmed').length;
-    const fp         = [...flagStatuses.values()].filter(s => s === 'false_positive').length;
-    const ni         = [...flagStatuses.values()].filter(s => s === 'needs_investigation').length;
+    setIsExporting(true);
+    try {
+      const totalFlags = analysisResult.flags?.length ?? analysisResult.total_flags ?? 0;
+      const confirmed  = [...flagStatuses.values()].filter(s => s === 'confirmed').length;
+      const fp         = [...flagStatuses.values()].filter(s => s === 'false_positive').length;
+      const ni         = [...flagStatuses.values()].filter(s => s === 'needs_investigation').length;
+      const unreviewed = Math.max(0, totalFlags - confirmed - fp - ni);
 
-    const report = {
-      report_title: 'CredScan AI — Credential Exposure Analysis Report',
-      generated_at: new Date().toISOString(),
-      video_metadata: {
-        filename:  videoFile?.name || 'Sample Transcript',
-        duration:  formatTime(videoDuration),
-        file_size: videoFile ? formatFileSize(videoFile.size) : 'N/A',
-      },
-      transcription_method: isSampleMode ? 'sample' : transcriptionMethod,
-      transcription_language: (transcriptionMethod === 'browser' || transcriptionMethod === 'openai')
-        ? (transcriptionLanguage === 'auto' ? `auto:${resolvedTranscriptionLanguage}` : transcriptionLanguage)
-        : null,
-      analysis_summary: {
-        overall_risk:       analysisResult.overall_risk,
-        total_flags:        totalFlags,
-        confirmed_findings: confirmed,
-        false_positives:    fp,
-        needs_investigation: ni,
-        unreviewed:         Math.max(0, totalFlags - confirmed - fp - ni),
-      },
-      flags: (analysisResult.flags || []).map(f => ({
-        id:              f.id,
-        timestamp:       `${f.timestamp_start} — ${f.timestamp_end}`,
-        risk_level:      f.risk_level,
-        category:        f.category,
-        flagged_text:    f.text,
-        ai_explanation:  f.explanation,
-        auditor_status:  flagStatuses.get(f.id) || 'unreviewed',
-        auditor_notes:   flagNotes.get(f.id) || '',
-        frames_extracted: (extractedFrames.get(f.id) || []).length,
-        visual_analysis:  visualAnalysis.get(f.id) || null,
-        frameworks:      analysisResult.frameworks || [],
-      })),
-      visual_scan_findings: visualFindings,
-      remediation_recommendations: analysisResult.remediation || [],
-      disclaimer: 'This report was generated with AI assistance. CredScan AI flags potential risks; the auditor renders final judgment.',
-    };
+      const GOLD = '8A6D1F', INK = '1A1A1A', MUTE = '666666';
+      const riskHex = (r) => ({ HIGH: 'C00000', MEDIUM: 'B7791F', LOW: '3F7E4F', NONE: '777777' }[(r || '').toUpperCase()] || '777777');
 
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    const fname = (videoFile?.name || 'sample').replace(/\.[^.]+$/, '');
-    const date  = new Date().toISOString().slice(0, 10);
-    a.download  = `CredScan_Report_${fname}_${date}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+      // ── helpers ──
+      const H1 = (t) => new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 260, after: 120 },
+        children: [new TextRun({ text: t, bold: true, color: GOLD, size: 30 })] });
+      const H2 = (t) => new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { before: 200, after: 80 },
+        children: [new TextRun({ text: t, bold: true, color: INK, size: 24 })] });
+      const P = (runs, opts = {}) => new Paragraph({ spacing: { after: 80, ...(opts.spacing || {}) }, ...opts,
+        children: Array.isArray(runs) ? runs : [new TextRun({ text: String(runs ?? ''), size: 20, color: INK })] });
+      const label = (l, v, color = INK) => P([
+        new TextRun({ text: `${l}: `, bold: true, size: 20, color: MUTE }),
+        new TextRun({ text: String(v ?? '—'), size: 20, color }),
+      ]);
+      const bullet = (t) => new Paragraph({ bullet: { level: 0 }, spacing: { after: 40 },
+        children: [new TextRun({ text: String(t), size: 20, color: INK })] });
+      const cell = (children, { header = false, width, fill } = {}) => new TableCell({
+        width: width ? { size: width, type: WidthType.PERCENTAGE } : undefined,
+        shading: fill ? { type: ShadingType.CLEAR, fill } : (header ? { type: ShadingType.CLEAR, fill: 'F2ECDD' } : undefined),
+        margins: { top: 60, bottom: 60, left: 100, right: 100 },
+        children: Array.isArray(children) ? children : [children],
+      });
+      const txt = (t, o = {}) => new Paragraph({ children: [new TextRun({ text: String(t ?? ''), size: 18, ...o })] });
+
+      const statusText = (s) => getStatusLabel(s);
+      const fname = videoFile?.name || 'Sample Transcript';
+      const dateStr = new Date().toLocaleString();
+
+      // ── Title block ──
+      const children = [
+        new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 40 },
+          children: [new TextRun({ text: 'CredScan AI', bold: true, color: GOLD, size: 48 })] }),
+        new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 200 },
+          children: [new TextRun({ text: 'Credential Exposure Audit Report', size: 28, color: INK })] }),
+        label('Subject video', fname),
+        label('Generated', dateStr),
+        label('Duration', formatTime(videoDuration)),
+        label('File size', videoFile ? formatFileSize(videoFile.size) : 'N/A'),
+        label('Transcription', isSampleMode ? 'Sample transcript'
+          : `${transcriptionMethod}${(transcriptionMethod === 'browser' || transcriptionMethod === 'openai')
+            ? ` (${transcriptionLanguage === 'auto' ? `auto:${resolvedTranscriptionLanguage}` : transcriptionLanguage})` : ''}`),
+      ];
+
+      // ── Executive summary ──
+      children.push(H1('1. Executive Summary'));
+      children.push(P([
+        new TextRun({ text: 'Overall risk rating: ', bold: true, size: 20, color: MUTE }),
+        new TextRun({ text: (analysisResult.overall_risk || 'NONE').toUpperCase(), bold: true, size: 22, color: riskHex(analysisResult.overall_risk) }),
+      ]));
+      if (analysisResult.summary) children.push(P(analysisResult.summary));
+      children.push(new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          new TableRow({ tableHeader: true, children: [
+            cell(txt('Audio flags', { bold: true }), { header: true, width: 20 }),
+            cell(txt('Confirmed', { bold: true }), { header: true, width: 20 }),
+            cell(txt('False positive', { bold: true }), { header: true, width: 20 }),
+            cell(txt('Needs investigation', { bold: true }), { header: true, width: 20 }),
+            cell(txt('Unreviewed', { bold: true }), { header: true, width: 20 }),
+          ] }),
+          new TableRow({ children: [
+            cell(txt(totalFlags)), cell(txt(confirmed)), cell(txt(fp)), cell(txt(ni)), cell(txt(unreviewed)),
+          ] }),
+        ],
+      }));
+      children.push(P([new TextRun({ text: `Visual (on-screen) detections: ${visualFindings.length}`, size: 20, color: INK })], { spacing: { before: 120 } }));
+
+      // ── Audio findings ──
+      children.push(H1('2. Audio-Based Findings (Transcript Analysis)'));
+      if (!analysisResult.flags?.length) {
+        children.push(P('No credential exposure was flagged in the audio transcript.'));
+      } else {
+        analysisResult.flags.forEach((f) => {
+          children.push(new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { before: 180, after: 60 }, children: [
+            new TextRun({ text: `Finding A${f.id} — `, bold: true, size: 24, color: INK }),
+            new TextRun({ text: (f.risk_level || 'N/A').toUpperCase(), bold: true, size: 24, color: riskHex(f.risk_level) }),
+            new TextRun({ text: `  (${getCategoryLabel(f.category)})`, size: 20, color: MUTE }),
+          ] }));
+          children.push(label('Timestamp', `${f.timestamp_start} – ${f.timestamp_end}`));
+          children.push(label('Auditor status', statusText(flagStatuses.get(f.id)), riskHex(flagStatuses.get(f.id) === 'confirmed' ? 'HIGH' : 'NONE')));
+          children.push(P([new TextRun({ text: 'Flagged speech: ', bold: true, size: 20, color: MUTE }),
+            new TextRun({ text: `“${f.text}”`, italics: true, size: 20, color: INK })]));
+          children.push(P([new TextRun({ text: 'AI assessment: ', bold: true, size: 20, color: MUTE }),
+            new TextRun({ text: f.explanation || '—', size: 20, color: INK })]));
+          const va = visualAnalysis.get(f.id);
+          if (va) {
+            children.push(P([new TextRun({ text: 'Corroborating frame analysis: ', bold: true, size: 20, color: MUTE }),
+              new TextRun({ text: `${(va.visual_risk || 'NONE').toUpperCase()} visual risk`, size: 20, color: riskHex(va.visual_risk) }),
+              new TextRun({ text: va.system_detected ? ` — ${va.system_detected}` : '', size: 20, color: INK })]));
+            (va.findings || []).forEach(x => children.push(bullet(x)));
+          }
+          const note = flagNotes.get(f.id);
+          if (note) children.push(P([new TextRun({ text: 'Auditor notes: ', bold: true, size: 20, color: MUTE }), new TextRun({ text: note, size: 20, color: INK })]));
+        });
+      }
+
+      // ── Visual findings ──
+      children.push(H1('3. Visual Findings (On-Screen Credential Scan)'));
+      if (!visualFindings.length) {
+        children.push(P(isSampleMode
+          ? 'Visual scanning was not performed (sample transcript has no video).'
+          : 'No visible credentials were detected across the sampled video frames.'));
+      } else {
+        visualFindings.forEach((v, i) => {
+          children.push(new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { before: 180, after: 60 }, children: [
+            new TextRun({ text: `Visual V${i + 1} — `, bold: true, size: 24, color: INK }),
+            new TextRun({ text: (v.visual_risk || 'NONE').toUpperCase(), bold: true, size: 24, color: riskHex(v.visual_risk) }),
+            new TextRun({ text: `  @ ${v.timestamp}`, size: 20, color: MUTE }),
+          ] }));
+          if (v.credentials_visible) children.push(P([new TextRun({ text: 'Credentials visible on screen', bold: true, size: 20, color: 'C00000' })]));
+          if (v.system_detected) children.push(label('System detected', v.system_detected));
+          if (v.evidence_rating) children.push(label('Evidence strength', v.evidence_rating));
+          (v.findings || []).forEach(x => children.push(bullet(x)));
+          if (v.recommendation) children.push(P([new TextRun({ text: 'Recommendation: ', bold: true, size: 20, color: MUTE }), new TextRun({ text: v.recommendation, size: 20, color: INK })]));
+        });
+      }
+
+      // ── Remediation ──
+      if (analysisResult.remediation?.length) {
+        children.push(H1('4. Recommended Remediation'));
+        analysisResult.remediation.forEach(r => children.push(bullet(r)));
+      }
+
+      // ── Frameworks ──
+      if (analysisResult.frameworks?.length) {
+        children.push(H1('5. Control Framework References'));
+        analysisResult.frameworks.forEach(fw => children.push(bullet(fw)));
+      }
+
+      // ── Disclaimer ──
+      children.push(H1('Disclaimer'));
+      children.push(P([new TextRun({ text:
+        'This report was generated with AI assistance. CredScan AI flags potential credential exposure risks; the auditor renders the final professional judgment. AI analysis may produce false positives or miss exposures and does not replace a qualified review.',
+        italics: true, size: 18, color: MUTE })]));
+
+      const doc = new Document({
+        creator: 'CredScan AI',
+        title: 'Credential Exposure Audit Report',
+        styles: { default: { document: { run: { font: 'Calibri' } } } },
+        sections: [{ properties: {}, children }],
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      const base = (videoFile?.name || 'sample').replace(/\.[^.]+$/, '');
+      const date = new Date().toISOString().slice(0, 10);
+      a.download = `CredScan_Report_${base}_${date}.docx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('Word export failed:', e);
+      setProcessingError(`Could not generate the Word report: ${e.message}`);
+    } finally {
+      setIsExporting(false);
+    }
   }, [
     analysisResult,
     videoFile,
@@ -2134,8 +2252,8 @@ export default function App() {
             <Btn variant="outline" small onClick={() => setMode('chat')}>
               <ChatIcon size={13} /> Open chat
             </Btn>
-            <Btn variant="primary" small onClick={exportReport}>
-              <DownloadIcon size={13} /> Export report
+            <Btn variant="primary" small onClick={exportReport} disabled={isExporting}>
+              {isExporting ? <Spinner size={13} color="#0f0d0a" /> : <DownloadIcon size={13} />} {isExporting ? 'Exporting…' : 'Export report'}
             </Btn>
           </div>
         </div>
@@ -2838,8 +2956,8 @@ export default function App() {
             <Btn variant="outline" small onClick={() => setMode('chat')}>
               <ChatIcon size={12} /> Open chat
             </Btn>
-            <Btn variant="primary" small onClick={exportReport}>
-              <DownloadIcon size={12} /> Export report
+            <Btn variant="primary" small onClick={exportReport} disabled={isExporting}>
+              {isExporting ? <Spinner size={12} color="#0f0d0a" /> : <DownloadIcon size={12} />} {isExporting ? 'Exporting…' : 'Export report'}
             </Btn>
           </div>
         </div>
