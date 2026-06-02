@@ -957,9 +957,9 @@ export default function App() {
   const [chatInput, setChatInput]         = useState('');
   const [showManualInput, setShowManualInput] = useState(false);
   const [manualTranscript, setManualTranscript] = useState('');
-  const [apiKey, setApiKey]               = useState('');
+  const [apiKey, setApiKey]               = useState(() => localStorage.getItem('credscan_anthropic_key') || '');
   const [showApiKey, setShowApiKey]       = useState(false);
-  const [openAiApiKey, setOpenAiApiKey]   = useState('');
+  const [openAiApiKey, setOpenAiApiKey]   = useState(() => localStorage.getItem('credscan_openai_key') || '');
   const [showOpenAiApiKey, setShowOpenAiApiKey] = useState(false);
   const [showSettings, setShowSettings]   = useState(false);
   const [isSampleMode, setIsSampleMode]   = useState(false);
@@ -977,6 +977,16 @@ export default function App() {
   const [leftPanelTab, setLeftPanelTab]       = useState('audio');
   const [selectedVisualIdx, setSelectedVisualIdx] = useState(null);
   const [isExporting, setIsExporting]         = useState(false);
+
+  useEffect(() => {
+    if (apiKey) localStorage.setItem('credscan_anthropic_key', apiKey);
+    else localStorage.removeItem('credscan_anthropic_key');
+  }, [apiKey]);
+
+  useEffect(() => {
+    if (openAiApiKey) localStorage.setItem('credscan_openai_key', openAiApiKey);
+    else localStorage.removeItem('credscan_openai_key');
+  }, [openAiApiKey]);
 
   // Refs
   const videoRef        = useRef(null);
@@ -1858,8 +1868,9 @@ export default function App() {
                 {showApiKey ? 'Hide' : 'Show'}
               </button>
             </div>
-            <div style={{ marginTop: 10, fontSize: 11, color: T.textDim }}>
+            <div style={{ marginTop: 10, fontSize: 11, color: T.textDim, display: 'flex', alignItems: 'center', gap: 6 }}>
               Anthropic key (analysis/chat primary)
+              {apiKey && <span style={{ color: '#4ade80', fontWeight: 600 }}>✓ Saved</span>}
             </div>
 
             <div style={{ marginTop: 12, display: 'flex', gap: 6 }}>
@@ -1875,8 +1886,9 @@ export default function App() {
                 {showOpenAiApiKey ? 'Hide' : 'Show'}
               </button>
             </div>
-            <div style={{ marginTop: 6, fontSize: 11, color: T.textDim }}>
+            <div style={{ marginTop: 6, fontSize: 11, color: T.textDim, display: 'flex', alignItems: 'center', gap: 6 }}>
               OpenAI key (transcription + Anthropic fallback). Large videos are auto-converted to compact audio for Whisper.
+              {openAiApiKey && <span style={{ color: '#4ade80', fontWeight: 600, flexShrink: 0 }}>✓ Saved</span>}
             </div>
 
             <div style={{ marginTop: 12 }}>
@@ -1930,6 +1942,19 @@ export default function App() {
             </div>
             <div style={{ fontSize: 11, color: T.textDim, marginTop: 8 }}>
               Video frames stay in your browser. The transcript is sent to your AI model for analysis. With the OpenAI Whisper engine, extracted audio is also sent to OpenAI; the browser engine keeps audio on-device.
+            </div>
+            <div style={{ marginTop: 12, padding: '8px 10px', background: T.bgSurface, borderRadius: 6, border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 8 }}>
+                Keys are stored only in your browser's localStorage and never sent to our servers.
+              </div>
+              {(apiKey || openAiApiKey) && (
+                <button
+                  onClick={() => { setApiKey(''); setOpenAiApiKey(''); }}
+                  style={{ background: 'none', border: `1px solid #ef4444`, borderRadius: 5, padding: '5px 10px', color: '#ef4444', cursor: 'pointer', fontSize: 11 }}
+                >
+                  Clear saved keys
+                </button>
+              )}
             </div>
           </div>
         )}
