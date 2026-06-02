@@ -6,7 +6,8 @@ AI-powered credential exposure audit assistant. Detects inadvertently exposed lo
 
 ## Using the Railway app (no setup required)
 
-Open the public URL. On the welcome screen you will see an **API Keys** section:
+Open the public URL: https://credential-exposure-audit-assistant-production.up.railway.app/
+On the welcome screen you will see an **API Keys** section:
 
 1. **Anthropic key** (required for analysis, chat, and visual frame scanning) — get one at [console.anthropic.com](https://console.anthropic.com)
 2. **OpenAI key** (recommended for Whisper audio transcription; also used as Anthropic fallback) — get one at [platform.openai.com](https://platform.openai.com)
