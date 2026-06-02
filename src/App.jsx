@@ -1841,120 +1841,44 @@ export default function App() {
   const renderWelcome = () => (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '40px 24px' }}>
 
-      {/* Settings button */}
+      {/* Settings button (transcription options only) */}
       <div style={{ position: 'fixed', top: 20, right: 20 }}>
         <button onClick={() => setShowSettings(s => !s)}
           style={{ background: 'none', border: `1px solid ${T.border}`, borderRadius: 8, padding: '8px 10px', color: T.textMuted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
           <GearIcon size={14} /> Settings
         </button>
         {showSettings && (
-          <div style={{ position: 'absolute', right: 0, top: 44, background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 16, width: 320, zIndex: 100 }} className="fadeIn">
-            <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight, marginBottom: 10 }}>API Settings</div>
-            <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 8 }}>
-              Configure Anthropic and/or OpenAI keys for analysis, chat, and transcription.
-              <span style={{ color: T.gold }}> console.anthropic.com </span>or
-              <span style={{ color: T.gold }}> platform.openai.com</span>.
-            </div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input
-                type={showApiKey ? 'text' : 'password'}
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder="sk-ant-..."
-                style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.text, fontSize: 12, fontFamily: T.mono, outline: 'none' }}
-              />
-              <button onClick={() => setShowApiKey(s => !s)}
-                style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.textMuted, cursor: 'pointer', fontSize: 11 }}>
-                {showApiKey ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            <div style={{ marginTop: 10, fontSize: 11, color: T.textDim, display: 'flex', alignItems: 'center', gap: 6 }}>
-              Anthropic key (analysis/chat primary)
-              {apiKey && <span style={{ color: '#4ade80', fontWeight: 600 }}>✓ Saved</span>}
-            </div>
-
-            <div style={{ marginTop: 12, display: 'flex', gap: 6 }}>
-              <input
-                type={showOpenAiApiKey ? 'text' : 'password'}
-                value={openAiApiKey}
-                onChange={e => setOpenAiApiKey(e.target.value)}
-                placeholder="OpenAI key (optional override)"
-                style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.text, fontSize: 12, fontFamily: T.mono, outline: 'none' }}
-              />
-              <button onClick={() => setShowOpenAiApiKey(s => !s)}
-                style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.textMuted, cursor: 'pointer', fontSize: 11 }}>
-                {showOpenAiApiKey ? 'Hide' : 'Show'}
-              </button>
-            </div>
-            <div style={{ marginTop: 6, fontSize: 11, color: T.textDim, display: 'flex', alignItems: 'center', gap: 6 }}>
-              OpenAI key (transcription + Anthropic fallback). Large videos are auto-converted to compact audio for Whisper.
-              {openAiApiKey && <span style={{ color: '#4ade80', fontWeight: 600, flexShrink: 0 }}>✓ Saved</span>}
-            </div>
-
-            <div style={{ marginTop: 12 }}>
-              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Transcription engine</div>
+          <div style={{ position: 'absolute', right: 0, top: 44, background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 16, width: 300, zIndex: 100 }} className="fadeIn">
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight, marginBottom: 10 }}>Transcription Settings</div>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Engine</div>
               <select
                 value={transcriptionEngine}
                 onChange={e => setTranscriptionEngine(e.target.value)}
-                style={{
-                  width: '100%',
-                  background: T.bgInput,
-                  border: `1px solid ${T.border}`,
-                  borderRadius: 6,
-                  padding: '7px 10px',
-                  color: T.text,
-                  fontSize: 12,
-                  fontFamily: T.serif,
-                  outline: 'none',
-                  cursor: 'pointer',
-                }}
+                style={{ width: '100%', background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.text, fontSize: 12, fontFamily: T.serif, outline: 'none', cursor: 'pointer' }}
               >
                 {TRANSCRIPTION_ENGINE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
             </div>
-            <div style={{ marginTop: 12 }}>
-              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Transcription language</div>
+            <div>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 6 }}>Language</div>
               <select
                 value={transcriptionLanguage}
                 onChange={e => setTranscriptionLanguage(e.target.value)}
-                style={{
-                  width: '100%',
-                  background: T.bgInput,
-                  border: `1px solid ${T.border}`,
-                  borderRadius: 6,
-                  padding: '7px 10px',
-                  color: T.text,
-                  fontSize: 12,
-                  fontFamily: T.serif,
-                  outline: 'none',
-                  cursor: 'pointer',
-                }}
+                style={{ width: '100%', background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 10px', color: T.text, fontSize: 12, fontFamily: T.serif, outline: 'none', cursor: 'pointer' }}
               >
                 {TRANSCRIPTION_LANGUAGE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
               <div style={{ fontSize: 11, color: T.textDim, marginTop: 5 }}>
-                Auto mode uses OpenAI language detection (or browser locale when browser engine is active).
+                Auto uses OpenAI language detection (or browser locale with browser engine).
               </div>
             </div>
-            <div style={{ fontSize: 11, color: T.textDim, marginTop: 8 }}>
-              Video frames stay in your browser. The transcript is sent to your AI model for analysis. With the OpenAI Whisper engine, extracted audio is also sent to OpenAI; the browser engine keeps audio on-device.
-            </div>
-            <div style={{ marginTop: 12, padding: '8px 10px', background: T.bgSurface, borderRadius: 6, border: `1px solid ${T.border}` }}>
-              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 8 }}>
-                Keys are stored only in your browser's localStorage and never sent to our servers.
-              </div>
-              {(apiKey || openAiApiKey) && (
-                <button
-                  onClick={() => { setApiKey(''); setOpenAiApiKey(''); }}
-                  style={{ background: 'none', border: `1px solid #ef4444`, borderRadius: 5, padding: '5px 10px', color: '#ef4444', cursor: 'pointer', fontSize: 11 }}
-                >
-                  Clear saved keys
-                </button>
-              )}
+            <div style={{ fontSize: 11, color: T.textDim, marginTop: 10 }}>
+              Video frames stay in your browser. Transcript is sent to your AI model. With Whisper, extracted audio is also sent to OpenAI.
             </div>
           </div>
         )}
@@ -1974,6 +1898,67 @@ export default function App() {
           AI-powered credential exposure audit assistant for internal auditors.
           Detect inadvertently exposed login credentials in corporate training videos.
         </p>
+      </div>
+
+      {/* API Keys */}
+      <div style={{ width: '100%', maxWidth: 580, marginBottom: 24 }}>
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 12, padding: '16px 20px' }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: T.goldLight, marginBottom: 12 }}>API Keys</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 5, display: 'flex', alignItems: 'center', gap: 6 }}>
+                Anthropic{' '}
+                <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: T.gold, textDecoration: 'none' }}>console.anthropic.com</a>
+                {apiKey && <span style={{ color: '#4ade80', fontWeight: 600, marginLeft: 'auto' }}>✓</span>}
+              </div>
+              <div style={{ display: 'flex', gap: 5 }}>
+                <input
+                  type={showApiKey ? 'text' : 'password'}
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder="sk-ant-..."
+                  style={{ flex: 1, minWidth: 0, background: T.bgInput, border: `1px solid ${apiKey ? T.goldBorder : T.border}`, borderRadius: 6, padding: '7px 9px', color: T.text, fontSize: 12, fontFamily: T.mono, outline: 'none' }}
+                />
+                <button onClick={() => setShowApiKey(s => !s)}
+                  style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 8px', color: T.textMuted, cursor: 'pointer', fontSize: 10, flexShrink: 0 }}>
+                  {showApiKey ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 5, display: 'flex', alignItems: 'center', gap: 6 }}>
+                OpenAI{' '}
+                <a href="https://platform.openai.com" target="_blank" rel="noreferrer" style={{ color: T.gold, textDecoration: 'none' }}>platform.openai.com</a>
+                {openAiApiKey && <span style={{ color: '#4ade80', fontWeight: 600, marginLeft: 'auto' }}>✓</span>}
+              </div>
+              <div style={{ display: 'flex', gap: 5 }}>
+                <input
+                  type={showOpenAiApiKey ? 'text' : 'password'}
+                  value={openAiApiKey}
+                  onChange={e => setOpenAiApiKey(e.target.value)}
+                  placeholder="sk-proj-... (optional)"
+                  style={{ flex: 1, minWidth: 0, background: T.bgInput, border: `1px solid ${openAiApiKey ? T.goldBorder : T.border}`, borderRadius: 6, padding: '7px 9px', color: T.text, fontSize: 12, fontFamily: T.mono, outline: 'none' }}
+                />
+                <button onClick={() => setShowOpenAiApiKey(s => !s)}
+                  style={{ background: T.bgSurface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '7px 8px', color: T.textMuted, cursor: 'pointer', fontSize: 10, flexShrink: 0 }}>
+                  {showOpenAiApiKey ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: 11, color: T.textDim }}>
+              Keys are saved in your browser only — never sent to our servers.
+            </div>
+            {(apiKey || openAiApiKey) && (
+              <button
+                onClick={() => { setApiKey(''); setOpenAiApiKey(''); }}
+                style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 11, padding: '2px 0', flexShrink: 0 }}>
+                Clear keys
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Upload Zone */}
